@@ -24,12 +24,13 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tonic::{
     codec::CompressionEncoding,
     transport::{Channel, ClientTlsConfig},
-    Request, Status, Streaming,
+    Code, Request, Status, Streaming,
 };
 use tracing::{debug, warn};
 
@@ -39,6 +40,7 @@ use crate::{
     error::BQError,
     google::cloud::bigquery::storage::v1::{
         append_rows_request::{self, MissingValueInterpretation, ProtoData},
+        append_rows_response,
         big_query_write_client::BigQueryWriteClient,
         AppendRowsRequest, AppendRowsResponse, ProtoSchema,
     },
@@ -88,6 +90,123 @@ const HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 /// If a PING is not acknowledged within this time, the connection is
 /// considered dead.
 const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
+/// Error message used when the append response stream ends without yielding any responses.
+const EMPTY_APPEND_RESPONSE_STREAM_ERROR: &str = "append response stream ended without responses";
+/// Error message used when an append response message has neither append result nor error details.
+const APPEND_RESPONSE_MISSING_OUTCOME_ERROR: &str = "append response missing append_result/error outcome";
+/// Maximum number of attempts for retryable append failures.
+const MAX_APPEND_RETRY_ATTEMPTS: u32 = 10;
+/// Initial retry backoff in milliseconds for retryable append failures.
+const INITIAL_APPEND_RETRY_BACKOFF_MS: u64 = 500;
+/// Maximum retry backoff in milliseconds for retryable append failures.
+const MAX_APPEND_RETRY_BACKOFF_MS: u64 = 60_000;
+
+/// Returns true when a request-level status code should be retried.
+fn is_retryable_append_status(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable
+            | Code::Internal
+            | Code::Aborted
+            | Code::Cancelled
+            | Code::DeadlineExceeded
+            | Code::ResourceExhausted
+            | Code::Unknown
+    ) || is_idle_stream_close_message(status.message())
+}
+
+/// Returns true for the known BigQuery idle stream close message.
+fn is_idle_stream_close_message(message: &str) -> bool {
+    message.contains("Closing the stream because it has been inactive")
+}
+
+/// Converts a [`google.rpc.Status`] from in-stream append responses into tonic [`Status`].
+fn status_from_rpc_status(status: &crate::google::rpc::Status) -> Status {
+    let code = Code::from_i32(status.code);
+    Status::new(code, status.message.clone())
+}
+
+/// Normalizes a single append response message to success or request-level error.
+///
+/// The Storage Write API models per-request failures in the response `oneof` as `error`.
+/// Treating this as an explicit error keeps caller behavior consistent with transport errors.
+fn normalize_append_response(
+    response: AppendRowsResponse,
+    trace_id: &str,
+    batch_index: usize,
+    stream_name: &str,
+) -> Result<AppendRowsResponse, Status> {
+    match response.response.as_ref() {
+        Some(append_rows_response::Response::AppendResult(_)) => Ok(response),
+        Some(append_rows_response::Response::Error(status)) => Err(status_from_rpc_status(status)),
+        None => {
+            warn!(
+                trace_id = %trace_id,
+                batch_index,
+                stream_name = %stream_name,
+                "append response missing append_result/error outcome"
+            );
+
+            Err(Status::unavailable(APPEND_RESPONSE_MISSING_OUTCOME_ERROR))
+        }
+    }
+}
+
+/// Returns true when a batch should be retried based on response outcomes.
+///
+/// Retries occur only when all responses are retryable request-level errors.
+/// This avoids replaying already-acknowledged successful appends in mixed
+/// partial-success/partial-failure attempts.
+///
+/// Row-level errors are considered permanent and are not retried.
+fn should_retry_batch_responses(batch_responses: &[Result<AppendRowsResponse, Status>]) -> bool {
+    let mut saw_retryable_error = false;
+
+    for response in batch_responses {
+        match response {
+            Ok(_) => return false,
+            Err(status) => {
+                if is_retryable_append_status(status) {
+                    saw_retryable_error = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+
+    saw_retryable_error
+}
+
+/// Calculates exponential backoff for append retries.
+fn calculate_append_retry_backoff(attempt: u32) -> Duration {
+    let exponential = INITIAL_APPEND_RETRY_BACKOFF_MS
+        .saturating_mul(1u64 << attempt.min(10))
+        .min(MAX_APPEND_RETRY_BACKOFF_MS);
+    Duration::from_millis(exponential)
+}
+
+/// Ensures a batch has at least one append response.
+///
+/// A successfully started append RPC that yields no stream messages is an anomalous condition
+/// and must be treated as a request failure rather than a successful append.
+fn ensure_non_empty_batch_responses(
+    batch_responses: &mut Vec<Result<AppendRowsResponse, Status>>,
+    trace_id: &str,
+    batch_index: usize,
+    stream_name: &str,
+) {
+    if batch_responses.is_empty() {
+        warn!(
+            trace_id = %trace_id,
+            batch_index,
+            stream_name = %stream_name,
+            "append response stream ended without responses"
+        );
+
+        batch_responses.push(Err(Status::unavailable(EMPTY_APPEND_RESPONSE_STREAM_ERROR)));
+    }
+}
 
 /// Configuration for the BigQuery Storage Write API client.
 ///
@@ -517,12 +636,25 @@ impl BatchAppendResult {
         }
     }
 
-    /// Returns true if all responses in this batch are successful.
+    /// Returns true if all responses in this batch are successful append results.
     ///
-    /// Convenience method to quickly check batch success without
-    /// iterating through individual responses.
+    /// A successful response must satisfy all of:
+    /// - transport succeeded (`Ok`),
+    /// - response has no row-level errors,
+    /// - response outcome is `append_result` (not missing and not `error`).
     pub fn is_success(&self) -> bool {
-        self.responses.iter().all(|result| result.is_ok())
+        self.responses.iter().all(|result| {
+            let response = match result {
+                Ok(response) => response,
+                Err(_) => return false,
+            };
+
+            response.row_errors.is_empty()
+                && matches!(
+                    response.response.as_ref(),
+                    Some(append_rows_response::Response::AppendResult(_))
+                )
+        })
     }
 }
 
@@ -877,6 +1009,165 @@ impl StorageApi {
             })
     }
 
+    /// Processes a single table batch append workflow, including retry handling.
+    ///
+    /// A semaphore permit is acquired per network attempt so retries do not hold
+    /// capacity during backoff sleep.
+    async fn append_single_table_batch<M>(
+        &self,
+        idx: usize,
+        table_batch: TableBatch<M>,
+        trace_id: String,
+    ) -> BatchAppendResult
+    where
+        M: Message + Send + 'static,
+    {
+        let stream_name = table_batch.stream_name().to_string();
+        let row_count = table_batch.rows().len();
+
+        // We compute the proto schema once for the entire batch.
+        let proto_schema = Self::create_proto_schema(table_batch.table_descriptor());
+        let bytes_sent_counter = Arc::new(AtomicUsize::new(0));
+
+        let mut batch_responses = Vec::new();
+
+        for attempt in 0..MAX_APPEND_RETRY_ATTEMPTS {
+            batch_responses.clear();
+
+            let _permit: OwnedSemaphorePermit = match self.request_semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(err) => {
+                    warn!(
+                        trace_id = %trace_id,
+                        batch_index = idx,
+                        stream_name = %stream_name,
+                        error = %err,
+                        "failed to acquire request permit"
+                    );
+
+                    batch_responses.push(Err(Status::unavailable(format!("request permit error: {err}"))));
+
+                    break;
+                }
+            };
+
+            // Build the request stream which will split the request into multiple requests
+            // if necessary.
+            let request_stream = AppendRequestsStream::new(
+                table_batch.clone(),
+                proto_schema.clone(),
+                trace_id.clone(),
+                bytes_sent_counter.clone(),
+            );
+
+            match Self::new_authorized_request(self.auth.clone(), request_stream).await {
+                Ok(request) => match self.connection_pool.get_client().await {
+                    Ok(pooled_client) => {
+                        // Clone the client to get a cheap handle to the underlying HTTP/2
+                        // connection, then return the Object to the pool immediately.
+                        let mut grpc_client = pooled_client.grpc_client.clone();
+                        drop(pooled_client);
+
+                        match grpc_client.append_rows(request).await {
+                            Ok(response) => {
+                                let mut streaming_response = response.into_inner();
+                                while let Some(response) = streaming_response.next().await {
+                                    let normalized_response = match response {
+                                        Ok(response) => {
+                                            normalize_append_response(response, &trace_id, idx, &stream_name)
+                                        }
+                                        Err(status) => Err(status),
+                                    };
+
+                                    if let Err(status) = &normalized_response {
+                                        warn!(
+                                            trace_id = %trace_id,
+                                            batch_index = idx,
+                                            stream_name = %stream_name,
+                                            error = %status,
+                                            "batch append error response"
+                                        );
+                                    }
+
+                                    batch_responses.push(normalized_response);
+                                }
+
+                                ensure_non_empty_batch_responses(&mut batch_responses, &trace_id, idx, &stream_name);
+                            }
+                            Err(status) => {
+                                warn!(
+                                    trace_id = %trace_id,
+                                    batch_index = idx,
+                                    stream_name = %stream_name,
+                                    error = %status,
+                                    "failed to append batch"
+                                );
+
+                                batch_responses.push(Err(status));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            trace_id = %trace_id,
+                            batch_index = idx,
+                            stream_name = %stream_name,
+                            error = %err,
+                            "pool error"
+                        );
+
+                        batch_responses.push(Err(Status::unavailable(format!("pool error: {err}"))));
+                    }
+                },
+                Err(err) => {
+                    warn!(
+                        trace_id = %trace_id,
+                        batch_index = idx,
+                        stream_name = %stream_name,
+                        error = %err,
+                        "auth error"
+                    );
+
+                    batch_responses.push(Err(Status::unauthenticated(err.to_string())));
+                }
+            }
+
+            let should_retry = should_retry_batch_responses(&batch_responses);
+            if should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
+                let backoff = calculate_append_retry_backoff(attempt);
+
+                warn!(
+                    trace_id = %trace_id,
+                    batch_index = idx,
+                    stream_name = %stream_name,
+                    attempt = attempt + 1,
+                    max_attempts = MAX_APPEND_RETRY_ATTEMPTS,
+                    backoff_ms = backoff.as_millis(),
+                    "retrying batch due to retryable append errors"
+                );
+
+                sleep(backoff).await;
+
+                continue;
+            }
+
+            break;
+        }
+
+        let bytes_sent = bytes_sent_counter.load(Ordering::Relaxed);
+
+        debug!(
+            trace_id = %trace_id,
+            batch_index = idx,
+            stream_name = %stream_name,
+            row_count,
+            bytes_sent,
+            "batch completed"
+        );
+
+        BatchAppendResult::new(idx, batch_responses, bytes_sent)
+    }
+
     /// Appends rows from multiple table batches with concurrent processing.
     ///
     /// Uses the shared `request_semaphore` to control parallelism globally across
@@ -904,92 +1195,12 @@ impl StorageApi {
             return Ok(Vec::new());
         }
 
-        let semaphore = self.request_semaphore.clone();
-
         let mut join_set = JoinSet::new();
         for (idx, table_batch) in table_batches.enumerate() {
-            // Acquire a concurrency slot and hold it until responses are fully drained.
-            let permit = semaphore.clone().acquire_owned().await?;
             let trace_id = trace_id.to_string();
             let client = self.clone();
 
-            join_set.spawn(async move {
-                let stream_name = table_batch.stream_name().to_string();
-                let row_count = table_batch.rows().len();
-
-                // We compute the proto schema once for the entire batch.
-                let proto_schema = Self::create_proto_schema(table_batch.table_descriptor());
-                let bytes_sent_counter = Arc::new(AtomicUsize::new(0));
-
-                // Build the request stream which will split the request into multiple requests if necessary.
-                let request_stream =
-                    AppendRequestsStream::new(table_batch, proto_schema, trace_id.clone(), bytes_sent_counter.clone());
-
-                let mut batch_responses = Vec::new();
-
-                match Self::new_authorized_request(client.auth.clone(), request_stream).await {
-                    Ok(request) => match client.connection_pool.get_client().await {
-                        Ok(pooled_client) => {
-                            // Clone the client to get a cheap handle to the underlying HTTP/2 connection,
-                            // then return the Object to the pool immediately. This allows multiple tasks
-                            // to share the same connection via HTTP/2 multiplexing since the pool works
-                            // in FiFo mode, so this connection will be immediately be put back into the
-                            // queue to be used for the next append rows request.
-                            let mut grpc_client = pooled_client.grpc_client.clone();
-                            drop(pooled_client);
-
-                            match grpc_client.append_rows(request).await {
-                                Ok(response) => {
-                                    let mut streaming_response = response.into_inner();
-                                    while let Some(response) = streaming_response.next().await {
-                                        if let Err(e) = &response {
-                                            warn!(
-                                                trace_id = %trace_id,
-                                                batch_index = idx,
-                                                error = %e,
-                                                "batch append error response"
-                                            );
-                                        }
-                                        batch_responses.push(response);
-                                    }
-                                }
-                                Err(status) => {
-                                    warn!(
-                                        trace_id = %trace_id,
-                                        batch_index = idx,
-                                        stream_name = %stream_name,
-                                        error = %status,
-                                        "failed to append batch"
-                                    );
-                                    batch_responses.push(Err(status));
-                                }
-                            }
-                        }
-                        Err(pool_err) => {
-                            warn!(trace_id = %trace_id, batch_index = idx, error = %pool_err, "pool error");
-                            batch_responses.push(Err(Status::unknown(format!("pool error: {pool_err}"))));
-                        }
-                    },
-                    Err(err) => {
-                        warn!(trace_id = %trace_id, batch_index = idx, error = %err, "auth error");
-                        batch_responses.push(Err(Status::unknown(err.to_string())));
-                    }
-                }
-
-                drop(permit);
-
-                let bytes_sent = bytes_sent_counter.load(Ordering::Relaxed);
-                debug!(
-                    trace_id = %trace_id,
-                    batch_index = idx,
-                    stream_name = %stream_name,
-                    row_count,
-                    bytes_sent,
-                    "batch completed"
-                );
-
-                BatchAppendResult::new(idx, batch_responses, bytes_sent)
-            });
+            join_set.spawn(async move { client.append_single_table_batch(idx, table_batch, trace_id).await });
         }
 
         let mut batch_results = Vec::with_capacity(batches_num);
@@ -1098,14 +1309,20 @@ pub mod test {
     use prost::Message;
     use std::time::{Duration, SystemTime};
     use tokio_stream::StreamExt;
+    use tonic::Status;
 
+    use crate::google::cloud::bigquery::storage::v1::{append_rows_response, AppendRowsResponse, RowError};
+    use crate::google::rpc::Status as GoogleRpcStatus;
     use crate::model::dataset::Dataset;
     use crate::model::field_type::FieldType;
     use crate::model::table::Table;
     use crate::model::table_field_schema::TableFieldSchema;
     use crate::model::table_schema::TableSchema;
     use crate::storage::{
-        ColumnMode, ColumnType, ConnectionPool, FieldDescriptor, StorageApi, StreamName, TableBatch, TableDescriptor,
+        ensure_non_empty_batch_responses, is_retryable_append_status, normalize_append_response,
+        should_retry_batch_responses, BatchAppendResult, ColumnMode, ColumnType, ConnectionPool, FieldDescriptor,
+        StorageApi, StreamName, TableBatch, TableDescriptor, APPEND_RESPONSE_MISSING_OUTCOME_ERROR,
+        EMPTY_APPEND_RESPONSE_STREAM_ERROR,
     };
     use crate::{env_vars, Client};
 
@@ -1351,13 +1568,6 @@ pub mod test {
         // Verify all responses are successful and track total bytes sent.
         let mut total_bytes_across_all_batches = 0;
         for batch_result in batch_responses {
-            // Verify the batch was processed successfully.
-            assert!(
-                batch_result.is_success(),
-                "Batch {} should be successful.",
-                batch_result.batch_index,
-            );
-
             // Verify each individual response for detailed error reporting.
             for response in &batch_result.responses {
                 assert!(response.is_ok(), "Response should be successful: {response:?}");
@@ -1380,5 +1590,166 @@ pub mod test {
             total_bytes_across_all_batches > 0,
             "Total bytes sent across all batches should be greater than 0"
         );
+    }
+
+    #[test]
+    fn test_ensure_non_empty_batch_responses_adds_retryable_error_on_empty_stream() {
+        let mut batch_responses = Vec::new();
+
+        ensure_non_empty_batch_responses(
+            &mut batch_responses,
+            "test_trace",
+            0,
+            "projects/test/datasets/test/tables/test/streams/_default",
+        );
+
+        assert_eq!(batch_responses.len(), 1);
+        let err = batch_responses
+            .pop()
+            .expect("missing inserted error")
+            .expect_err("expected request error");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(err.message(), EMPTY_APPEND_RESPONSE_STREAM_ERROR);
+    }
+
+    #[test]
+    fn test_ensure_non_empty_batch_responses_keeps_existing_responses() {
+        let mut batch_responses = vec![Ok(AppendRowsResponse::default())];
+
+        ensure_non_empty_batch_responses(
+            &mut batch_responses,
+            "test_trace",
+            0,
+            "projects/test/datasets/test/tables/test/streams/_default",
+        );
+
+        assert_eq!(batch_responses.len(), 1);
+        assert!(batch_responses[0].is_ok());
+    }
+
+    #[test]
+    fn test_is_retryable_append_status_expected_codes() {
+        assert!(is_retryable_append_status(&Status::unavailable("unavailable")));
+        assert!(is_retryable_append_status(&Status::internal("internal")));
+        assert!(is_retryable_append_status(&Status::aborted("aborted")));
+        assert!(is_retryable_append_status(&Status::cancelled("cancelled")));
+        assert!(is_retryable_append_status(&Status::deadline_exceeded("deadline")));
+        assert!(is_retryable_append_status(&Status::resource_exhausted("quota")));
+        assert!(is_retryable_append_status(&Status::unknown("transport error")));
+        assert!(is_retryable_append_status(&Status::unknown("some unknown cause")));
+        assert!(is_retryable_append_status(&Status::failed_precondition(
+            "Closing the stream because it has been inactive"
+        )));
+
+        assert!(!is_retryable_append_status(&Status::invalid_argument("invalid")));
+        assert!(!is_retryable_append_status(&Status::failed_precondition(
+            "failed precondition"
+        )));
+    }
+
+    #[test]
+    fn test_normalize_append_response_converts_error_and_missing_outcome_to_status() {
+        let error_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: Vec::new(),
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: Some(append_rows_response::Response::Error(GoogleRpcStatus {
+                code: tonic::Code::Internal as i32,
+                message: "internal error".to_string(),
+                details: Vec::new(),
+            })),
+        };
+        let normalized = normalize_append_response(
+            error_response,
+            "test_trace",
+            0,
+            "projects/test/datasets/test/tables/test/streams/_default",
+        );
+        let status = normalized.expect_err("expected normalized error");
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "internal error");
+
+        let missing_outcome_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: Vec::new(),
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: None,
+        };
+        let normalized = normalize_append_response(
+            missing_outcome_response,
+            "test_trace",
+            0,
+            "projects/test/datasets/test/tables/test/streams/_default",
+        );
+        let status = normalized.expect_err("expected missing outcome to be error");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), APPEND_RESPONSE_MISSING_OUTCOME_ERROR);
+    }
+
+    #[test]
+    fn test_should_retry_batch_responses_only_for_retryable_request_errors() {
+        assert!(should_retry_batch_responses(&[Err(Status::unavailable("retry"))]));
+
+        assert!(!should_retry_batch_responses(&[
+            Err(Status::unavailable("retry")),
+            Err(Status::invalid_argument("do not retry")),
+        ]));
+
+        let success_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: Vec::new(),
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: Some(append_rows_response::Response::AppendResult(
+                append_rows_response::AppendResult { offset: None },
+            )),
+        };
+        assert!(!should_retry_batch_responses(&[
+            Ok(success_response),
+            Err(Status::unavailable("retry")),
+        ]));
+
+        let row_error_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: vec![RowError::default()],
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: Some(append_rows_response::Response::AppendResult(
+                append_rows_response::AppendResult { offset: None },
+            )),
+        };
+        assert!(!should_retry_batch_responses(&[Ok(row_error_response)]));
+    }
+
+    #[test]
+    fn test_batch_append_result_is_success_requires_append_result_and_no_row_errors() {
+        let success_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: Vec::new(),
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: Some(append_rows_response::Response::AppendResult(
+                append_rows_response::AppendResult { offset: None },
+            )),
+        };
+        let batch_result = BatchAppendResult::new(0, vec![Ok(success_response)], 10);
+        assert!(batch_result.is_success());
+
+        let missing_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: Vec::new(),
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: None,
+        };
+        let batch_result = BatchAppendResult::new(0, vec![Ok(missing_response)], 10);
+        assert!(!batch_result.is_success());
+
+        let row_error_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: vec![RowError::default()],
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: Some(append_rows_response::Response::AppendResult(
+                append_rows_response::AppendResult { offset: None },
+            )),
+        };
+        let batch_result = BatchAppendResult::new(0, vec![Ok(row_error_response)], 10);
+        assert!(!batch_result.is_success());
     }
 }
