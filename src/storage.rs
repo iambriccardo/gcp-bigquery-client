@@ -3,15 +3,15 @@
 //! This module provides an implementation of the BigQuery Storage Write API,
 //! enabling efficient streaming of structured data to BigQuery tables.
 
-use deadpool::managed::{Manager, Object, Pool, QueueMode};
 use futures::stream::Stream;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use pin_project::pin_project;
 use prost::Message;
 use prost_types::{
     field_descriptor_proto::{Label, Type},
     DescriptorProto, FieldDescriptorProto,
 };
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -24,7 +24,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tonic::{
@@ -211,15 +211,14 @@ fn ensure_non_empty_batch_responses(
 /// Configuration for the BigQuery Storage Write API client.
 ///
 /// A single HTTP/2 connection can support 1-10+ MBps throughput with up to
-/// 100 concurrent gRPC streams. The pool provides fault isolation rather than
-/// increased parallelism.
+/// 100 concurrent gRPC streams. Multiple workers provide fault isolation and
+/// parallel request handling across independent connections.
 #[derive(Debug, Clone)]
 pub struct StorageApiConfig {
-    /// Number of connections in the pool.
+    /// Number of connection workers.
     ///
-    /// With HTTP/2 multiplexing, a small number of connections (2-4) is typically
-    /// sufficient for high throughput. Multiple gRPC streams share each connection,
-    /// so additional connections provide fault isolation rather than parallelism.
+    /// This controls how many background worker tasks are spawned, each owning
+    /// one gRPC connection. The field name is kept for backward compatibility.
     /// Default: 4.
     pub connection_pool_size: usize,
     /// Maximum number of inflight gRPC requests across all StorageApi operations.
@@ -254,198 +253,397 @@ impl Default for StorageApiConfig {
     }
 }
 
-/// Connection pool for managing multiple gRPC clients to BigQuery Storage Write API.
-///
-/// Uses deadpool to maintain a pool of persistent connections with proper
-/// resource management, automatic cleanup, and efficient connection reuse.
-/// Implements epoch-based connection lifecycle to ensure connections created
-/// before a reset aren't reused.
-#[derive(Clone)]
-struct ConnectionPool {
-    /// The underlying deadpool connection pool.
-    pool: Pool<BigQueryWriteClientManager>,
-    /// Current connection epoch for tracking connection generations.
-    ///
-    /// Incremented each time connections are released to prevent reuse
-    /// of connections from previous epochs. Protected by RwLock to ensure
-    /// atomic epoch changes without allowing concurrent connection operations.
-    epoch: Arc<RwLock<u64>>,
+type WorkerAppendResult = Vec<Result<AppendRowsResponse, Status>>;
+
+/// Creates a configured gRPC client for BigQuery Storage Write API.
+async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
+    // Since Tonic 0.12.0, TLS root certificates are no longer included by default.
+    // They must now be specified explicitly.
+    // See: https://github.com/hyperium/tonic/pull/1731
+    let tls_config = ClientTlsConfig::new()
+        .domain_name(BIGQUERY_STORAGE_API_DOMAIN)
+        .with_enabled_roots();
+
+    let channel = Channel::from_static(BIG_QUERY_STORAGE_API_URL)
+        .tls_config(tls_config)?
+        // Configure HTTP/2 keepalive to detect dead connections and prevent
+        // proxies from closing idle connections.
+        .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS))
+        .keep_alive_timeout(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS))
+        .keep_alive_while_idle(true)
+        .connect()
+        .await?;
+
+    Ok(BigQueryWriteClient::new(channel)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE_BYTES)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip))
 }
 
-/// Wrapper around BigQueryWriteClient with epoch tracking.
-struct PooledClient {
-    /// The underlying gRPC client.
-    grpc_client: BigQueryWriteClient<Channel>,
-    /// Epoch when this connection was created.
-    ///
-    /// Used to determine if this connection should be recycled or discarded
-    /// when returned to the pool. Connections with epochs older than the
-    /// current pool epoch are discarded.
-    epoch: u64,
+/// Messages sent to connection worker tasks.
+enum ConnectionWorkerMessage {
+    AppendRows {
+        append_requests: Vec<AppendRowsRequest>,
+        trace_id: String,
+        batch_index: usize,
+        stream_name: String,
+        response_tx: oneshot::Sender<WorkerAppendResult>,
+    },
+    Invalidate {
+        response_tx: oneshot::Sender<Result<(), Status>>,
+    },
+    Close,
 }
 
-/// Manager for creating and managing BigQuery Storage Write API gRPC clients.
-///
-/// Implements the deadpool Manager trait to handle connection lifecycle
-/// including creation, health checks, and cleanup of gRPC clients.
-/// Tracks the current epoch to stamp new connections.
-struct BigQueryWriteClientManager {
-    /// Reference to the current epoch counter shared with the connection pool.
-    epoch: Arc<RwLock<u64>>,
+/// Returns true if a worker should recreate its connection after this error.
+fn should_recreate_worker_connection(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Internal | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown | Code::Aborted
+    ) || is_idle_stream_close_message(status.message())
 }
 
-impl Manager for BigQueryWriteClientManager {
-    type Type = PooledClient;
-    type Error = BQError;
-
-    /// Creates a new gRPC client for BigQuery Storage Write API.
-    ///
-    /// Establishes a secure TLS connection with HTTP/2 keepalive, compression,
-    /// and size limits configured for optimal performance and reliability.
-    /// Stamps the connection with the current epoch for lifecycle tracking.
-    async fn create(&self) -> Result<Self::Type, Self::Error> {
-        // Acquire read lock to get current epoch. This awaits if epoch is being modified.
-        let current_epoch = *self.epoch.read().await;
-
-        // Since Tonic 0.12.0, TLS root certificates are no longer included by default.
-        // They must now be specified explicitly.
-        // See: https://github.com/hyperium/tonic/pull/1731
-        let tls_config = ClientTlsConfig::new()
-            .domain_name(BIGQUERY_STORAGE_API_DOMAIN)
-            .with_enabled_roots();
-
-        let channel = Channel::from_static(BIG_QUERY_STORAGE_API_URL)
-            .tls_config(tls_config)?
-            // Configure HTTP/2 keepalive to detect dead connections and prevent
-            // proxies from closing idle connections.
-            .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS))
-            .keep_alive_timeout(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS))
-            .keep_alive_while_idle(true)
-            .connect()
-            .await?;
-
-        let client = BigQueryWriteClient::new(channel)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE_BYTES)
-            .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES)
-            .send_compressed(CompressionEncoding::Gzip)
-            .accept_compressed(CompressionEncoding::Gzip);
-
-        debug!(epoch = current_epoch, "grpc connection created");
-
-        Ok(PooledClient {
-            grpc_client: client,
-            epoch: current_epoch,
-        })
+/// Ensures a worker has an active gRPC client, creating one if needed.
+async fn ensure_worker_client(
+    grpc_client: &mut Option<BigQueryWriteClient<Channel>>,
+) -> Result<&mut BigQueryWriteClient<Channel>, Status> {
+    if grpc_client.is_none() {
+        match create_grpc_client().await {
+            Ok(client) => {
+                *grpc_client = Some(client);
+            }
+            Err(err) => {
+                return Err(Status::unavailable(format!(
+                    "failed to create worker connection: {err}"
+                )));
+            }
+        }
     }
 
-    /// Recycles a gRPC client connection back into the pool.
-    ///
-    /// Checks if the connection's epoch matches the current pool epoch.
-    /// Connections from old epochs are discarded to prevent reuse after
-    /// a connection reset. With HTTP/2 keepalive enabled, dead connections
-    /// are detected automatically via PING frames.
-    async fn recycle(
-        &self,
-        conn: &mut Self::Type,
-        _metrics: &deadpool::managed::Metrics,
-    ) -> deadpool::managed::RecycleResult<Self::Error> {
-        // Acquire read lock to get current epoch. This awaits if epoch is being modified.
-        let current_epoch = *self.epoch.read().await;
+    match grpc_client.as_mut() {
+        Some(client) => Ok(client),
+        None => Err(Status::unavailable("worker connection unavailable")),
+    }
+}
 
-        if conn.epoch < current_epoch {
-            // Connection is from an old epoch, discard it.
-            debug!(
-                connection_epoch = conn.epoch,
-                current_epoch = current_epoch,
-                "discarding connection from old epoch"
+/// Executes a batch append on a worker connection.
+async fn worker_handle_append_rows(
+    grpc_client: &mut Option<BigQueryWriteClient<Channel>>,
+    auth: Arc<dyn Authenticator>,
+    append_requests: Vec<AppendRowsRequest>,
+    trace_id: &str,
+    batch_index: usize,
+    stream_name: &str,
+) -> WorkerAppendResult {
+    let mut batch_responses = Vec::new();
+
+    if append_requests.is_empty() {
+        ensure_non_empty_batch_responses(&mut batch_responses, trace_id, batch_index, stream_name);
+        return batch_responses;
+    }
+
+    let request = match StorageApi::new_authorized_request(auth, tokio_stream::iter(append_requests)).await {
+        Ok(request) => request,
+        Err(err) => {
+            warn!(
+                trace_id = %trace_id,
+                batch_index,
+                stream_name = %stream_name,
+                error = %err,
+                "auth error in connection worker"
             );
-            return Err(deadpool::managed::RecycleError::Message(
-                "connection epoch is outdated".into(),
-            ));
+            batch_responses.push(Err(Status::unauthenticated(err.to_string())));
+            return batch_responses;
+        }
+    };
+
+    let append_result = {
+        let client = match ensure_worker_client(grpc_client).await {
+            Ok(client) => client,
+            Err(status) => {
+                batch_responses.push(Err(status));
+                return batch_responses;
+            }
+        };
+
+        client.append_rows(request).await
+    };
+
+    match append_result {
+        Ok(response) => {
+            let mut recreate_connection = false;
+            let mut streaming_response = response.into_inner();
+
+            while let Some(response) = streaming_response.next().await {
+                let normalized_response = match response {
+                    Ok(response) => normalize_append_response(response, trace_id, batch_index, stream_name),
+                    Err(status) => Err(status),
+                };
+
+                if let Err(status) = &normalized_response {
+                    warn!(
+                        trace_id = %trace_id,
+                        batch_index,
+                        stream_name = %stream_name,
+                        error = %status,
+                        "batch append error response"
+                    );
+
+                    if should_recreate_worker_connection(status) {
+                        recreate_connection = true;
+                    }
+                }
+
+                batch_responses.push(normalized_response);
+            }
+
+            ensure_non_empty_batch_responses(&mut batch_responses, trace_id, batch_index, stream_name);
+            if batch_responses
+                .iter()
+                .any(|response| matches!(response, Err(status) if should_recreate_worker_connection(status)))
+            {
+                recreate_connection = true;
+            }
+
+            if recreate_connection {
+                *grpc_client = None;
+            }
+        }
+        Err(status) => {
+            if should_recreate_worker_connection(&status) {
+                *grpc_client = None;
+            }
+
+            warn!(
+                trace_id = %trace_id,
+                batch_index,
+                stream_name = %stream_name,
+                error = %status,
+                "failed to append batch in connection worker"
+            );
+
+            batch_responses.push(Err(status));
+        }
+    }
+
+    batch_responses
+}
+
+/// Handles one worker message and returns whether the worker loop should continue.
+async fn handle_connection_worker_message(
+    worker_id: usize,
+    auth: Arc<dyn Authenticator>,
+    grpc_client: &mut Option<BigQueryWriteClient<Channel>>,
+    message: ConnectionWorkerMessage,
+) -> bool {
+    match message {
+        ConnectionWorkerMessage::AppendRows {
+            append_requests,
+            trace_id,
+            batch_index,
+            stream_name,
+            response_tx,
+        } => {
+            let result =
+                worker_handle_append_rows(grpc_client, auth, append_requests, &trace_id, batch_index, &stream_name)
+                    .await;
+
+            if response_tx.send(result).is_err() {
+                warn!(worker_id, "failed to send append result from worker");
+            }
+
+            true
+        }
+        ConnectionWorkerMessage::Invalidate { response_tx } => {
+            *grpc_client = None;
+
+            let result = match create_grpc_client().await {
+                Ok(client) => {
+                    *grpc_client = Some(client);
+                    Ok(())
+                }
+                Err(err) => Err(Status::unavailable(format!(
+                    "failed to recreate worker connection: {err}"
+                ))),
+            };
+
+            if response_tx.send(result).is_err() {
+                warn!(worker_id, "failed to send invalidate ack from worker");
+            }
+
+            true
+        }
+        ConnectionWorkerMessage::Close => false,
+    }
+}
+
+/// Background task loop for a single connection worker.
+async fn run_connection_worker(
+    worker_id: usize,
+    auth: Arc<dyn Authenticator>,
+    mut rx: mpsc::Receiver<ConnectionWorkerMessage>,
+) {
+    let mut grpc_client: Option<BigQueryWriteClient<Channel>> = None;
+
+    while let Some(message) = rx.recv().await {
+        let handled = AssertUnwindSafe(handle_connection_worker_message(
+            worker_id,
+            auth.clone(),
+            &mut grpc_client,
+            message,
+        ))
+        .catch_unwind()
+        .await;
+
+        match handled {
+            Ok(keep_running) => {
+                if !keep_running {
+                    break;
+                }
+            }
+            Err(_) => {
+                warn!(
+                    worker_id,
+                    "connection worker crashed while handling message; restarting state"
+                );
+                grpc_client = None;
+            }
+        }
+    }
+
+    debug!(worker_id, "connection worker closed");
+}
+
+/// Shared set of long-lived connection workers.
+#[derive(Clone)]
+struct ConnectionWorkerSet {
+    inner: Arc<ConnectionWorkerSetInner>,
+}
+
+/// Internal connection worker state shared across clones.
+struct ConnectionWorkerSetInner {
+    senders: Vec<mpsc::Sender<ConnectionWorkerMessage>>,
+    next_worker: AtomicUsize,
+}
+
+impl Drop for ConnectionWorkerSetInner {
+    fn drop(&mut self) {
+        for sender in &self.senders {
+            let _ = sender.try_send(ConnectionWorkerMessage::Close);
+        }
+    }
+}
+
+impl ConnectionWorkerSet {
+    /// Spawns a fixed number of connection workers.
+    fn new(worker_count: usize, queue_capacity: usize, auth: Arc<dyn Authenticator>) -> Self {
+        let worker_count = worker_count.max(1);
+        let queue_capacity = queue_capacity.max(1);
+
+        let mut senders = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            let (tx, rx) = mpsc::channel(queue_capacity);
+            senders.push(tx);
+
+            tokio::spawn(run_connection_worker(worker_id, auth.clone(), rx));
         }
 
-        // This should never happen - a connection can't be from the future.
-        debug_assert!(
-            conn.epoch == current_epoch,
-            "connection epoch {} > current epoch {}: this is a bug",
-            conn.epoch,
-            current_epoch
-        );
-
-        Ok(())
-    }
-}
-
-impl ConnectionPool {
-    /// Creates a new connection pool with the specified maximum size.
-    ///
-    /// Establishes a managed pool that creates connections on-demand and
-    /// recycles them efficiently for optimal performance. With HTTP/2
-    /// multiplexing, a small number of connections (2-4) is typically
-    /// sufficient for high throughput, as multiple gRPC streams can
-    /// share the same underlying connection. Initializes epoch tracking
-    /// for connection lifecycle management.
-    async fn new(max_size: usize) -> Result<Self, BQError> {
-        let epoch = Arc::new(RwLock::new(0));
-        let manager = BigQueryWriteClientManager { epoch: epoch.clone() };
-        let pool = Pool::builder(manager)
-            .max_size(max_size)
-            // We must use Fifo since we want to always get the least recently used connection to cycle
-            // through connections in the pool.
-            .queue_mode(QueueMode::Fifo)
-            .build()
-            .map_err(|e| BQError::ConnectionPoolError(format!("failed to create connection pool: {e}")))?;
-
-        debug!(max_size, "connection pool initialized");
-        Ok(Self { pool, epoch })
+        Self {
+            inner: Arc::new(ConnectionWorkerSetInner {
+                senders,
+                next_worker: AtomicUsize::new(0),
+            }),
+        }
     }
 
-    /// Retrieves a client from the pool.
-    ///
-    /// Returns a managed connection object that automatically returns
-    /// the connection to the pool when dropped. Connections are automatically
-    /// validated against the current epoch during recycling.
-    async fn get_client(&self) -> Result<Object<BigQueryWriteClientManager>, BQError> {
-        self.pool
-            .get()
-            .await
-            .map_err(|e| BQError::ConnectionPoolError(format!("failed to get connection from pool: {e}")))
+    /// Sends append requests to one worker selected in round-robin order.
+    async fn append_rows(
+        &self,
+        append_requests: Vec<AppendRowsRequest>,
+        trace_id: &str,
+        batch_index: usize,
+        stream_name: &str,
+    ) -> WorkerAppendResult {
+        if self.inner.senders.is_empty() {
+            return vec![Err(Status::unavailable("no connection workers available"))];
+        }
+
+        let worker_index = self.inner.next_worker.fetch_add(1, Ordering::Relaxed) % self.inner.senders.len();
+        let sender = self.inner.senders[worker_index].clone();
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let message = ConnectionWorkerMessage::AppendRows {
+            append_requests,
+            trace_id: trace_id.to_string(),
+            batch_index,
+            stream_name: stream_name.to_string(),
+            response_tx,
+        };
+
+        if let Err(err) = sender.send(message).await {
+            warn!(
+                worker_index,
+                trace_id = %trace_id,
+                batch_index,
+                stream_name = %stream_name,
+                error = %err,
+                "failed to send append request to connection worker"
+            );
+            return vec![Err(Status::unavailable(format!("connection worker send error: {err}")))];
+        }
+
+        match response_rx.await {
+            Ok(responses) => responses,
+            Err(err) => {
+                warn!(
+                    worker_index,
+                    trace_id = %trace_id,
+                    batch_index,
+                    stream_name = %stream_name,
+                    error = %err,
+                    "failed to receive append result from connection worker"
+                );
+                vec![Err(Status::unavailable(format!(
+                    "connection worker response error: {err}"
+                )))]
+            }
+        }
     }
 
-    /// Invalidates all connections by incrementing the connection epoch.
-    ///
-    /// Increments the connection epoch to invalidate all existing connections,
-    /// both idle and in-use. Idle connections are immediately cleared from the
-    /// pool, while in-use connections will be discarded when returned during
-    /// recycling. Useful for recovering from network errors, after DDL changes,
-    /// or when refreshing stale connections. Awaits connection creation and
-    /// recycling operations during the epoch change to ensure consistency.
+    /// Invalidates and recreates the connection in each worker.
     async fn invalidate_all(&self) {
-        // Optimistically clear all idle connections from the pool. In-use connections
-        // will be automatically discarded when returned via the recycle check.
-        //
-        // We do this outside of the lock to minimize critical section and knowing that we are fine
-        // if new connections are created before the new epoch is created since those will be recycled
-        // later on.
-        //
-        // This `retain` call is implemented as an optimization to immediately clear connections and
-        // reduce recycling attempts which could decrease the pool performance since the connection
-        // acquisition in `deadpool` relies on a loop.
-        self.pool.retain(|_, _| false);
+        let mut join_set = JoinSet::new();
 
-        // Acquire write lock to modify epoch. This awaits all connection
-        // creation and recycling operations during the epoch change.
-        let mut epoch = self.epoch.write().await;
+        for (worker_index, sender) in self.inner.senders.iter().cloned().enumerate() {
+            join_set.spawn(async move {
+                let (response_tx, response_rx) = oneshot::channel();
+                sender
+                    .send(ConnectionWorkerMessage::Invalidate { response_tx })
+                    .await
+                    .map_err(|err| Status::unavailable(format!("failed to send invalidate message: {err}")))?;
 
-        let old_epoch = *epoch;
-        *epoch += 1;
-        let new_epoch = *epoch;
+                response_rx
+                    .await
+                    .map_err(|err| Status::unavailable(format!("failed to receive invalidate ack: {err}")))??;
 
-        debug!(
-            old_epoch = old_epoch,
-            new_epoch = new_epoch,
-            "all connections released, epoch bumped"
-        );
+                Ok::<usize, Status>(worker_index)
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(worker_index)) => {
+                    debug!(worker_index, "invalidated connection worker");
+                }
+                Ok(Err(status)) => {
+                    warn!(error = %status, "failed to invalidate connection worker");
+                }
+                Err(err) => {
+                    warn!(error = %err, "connection worker invalidate task failed");
+                }
+            }
+        }
     }
 }
 
@@ -859,8 +1057,8 @@ where
 /// High-level client for BigQuery Storage Write API operations.
 #[derive(Clone)]
 pub struct StorageApi {
-    /// Connection pool for gRPC clients to BigQuery Storage Write API.
-    connection_pool: ConnectionPool,
+    /// Shared set of connection workers for append operations.
+    connection_workers: ConnectionWorkerSet,
     /// Authentication provider for API requests.
     auth: Arc<dyn Authenticator>,
     /// Base URL for BigQuery API endpoints.
@@ -872,11 +1070,13 @@ pub struct StorageApi {
 impl StorageApi {
     /// Creates a new storage API client instance with a custom configuration.
     pub(crate) async fn with_config(auth: Arc<dyn Authenticator>, config: StorageApiConfig) -> Result<Self, BQError> {
-        let connection_pool = ConnectionPool::new(config.connection_pool_size).await?;
+        let worker_count = config.connection_pool_size.max(1);
+        let queue_capacity = (config.max_inflight_requests / worker_count).max(1);
+        let connection_workers = ConnectionWorkerSet::new(worker_count, queue_capacity, auth.clone());
         let request_semaphore = Arc::new(Semaphore::new(config.max_inflight_requests));
 
         Ok(Self {
-            connection_pool,
+            connection_workers,
             auth,
             base_url: BIG_QUERY_V2_URL.to_string(),
             request_semaphore,
@@ -959,10 +1159,9 @@ impl StorageApi {
         };
 
         let request = Self::new_authorized_request(self.auth.clone(), get_write_stream_request).await?;
-        let mut pooled_client = self.connection_pool.get_client().await?;
+        let mut grpc_client = create_grpc_client().await?;
 
-        pooled_client
-            .grpc_client
+        grpc_client
             .get_write_stream(request)
             .await
             .map(|resp| resp.into_inner())
@@ -996,10 +1195,9 @@ impl StorageApi {
 
         let request =
             Self::new_authorized_request(self.auth.clone(), tokio_stream::iter(vec![append_rows_request])).await?;
-        let mut pooled_client = self.connection_pool.get_client().await?;
+        let mut grpc_client = create_grpc_client().await?;
 
-        pooled_client
-            .grpc_client
+        grpc_client
             .append_rows(request)
             .await
             .map(|resp| resp.into_inner())
@@ -1059,78 +1257,17 @@ impl StorageApi {
                 trace_id.clone(),
                 bytes_sent_counter.clone(),
             );
+            tokio::pin!(request_stream);
 
-            match Self::new_authorized_request(self.auth.clone(), request_stream).await {
-                Ok(request) => match self.connection_pool.get_client().await {
-                    Ok(pooled_client) => {
-                        // Clone the client to get a cheap handle to the underlying HTTP/2
-                        // connection, then return the Object to the pool immediately.
-                        let mut grpc_client = pooled_client.grpc_client.clone();
-                        drop(pooled_client);
-
-                        match grpc_client.append_rows(request).await {
-                            Ok(response) => {
-                                let mut streaming_response = response.into_inner();
-                                while let Some(response) = streaming_response.next().await {
-                                    let normalized_response = match response {
-                                        Ok(response) => {
-                                            normalize_append_response(response, &trace_id, idx, &stream_name)
-                                        }
-                                        Err(status) => Err(status),
-                                    };
-
-                                    if let Err(status) = &normalized_response {
-                                        warn!(
-                                            trace_id = %trace_id,
-                                            batch_index = idx,
-                                            stream_name = %stream_name,
-                                            error = %status,
-                                            "batch append error response"
-                                        );
-                                    }
-
-                                    batch_responses.push(normalized_response);
-                                }
-
-                                ensure_non_empty_batch_responses(&mut batch_responses, &trace_id, idx, &stream_name);
-                            }
-                            Err(status) => {
-                                warn!(
-                                    trace_id = %trace_id,
-                                    batch_index = idx,
-                                    stream_name = %stream_name,
-                                    error = %status,
-                                    "failed to append batch"
-                                );
-
-                                batch_responses.push(Err(status));
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            trace_id = %trace_id,
-                            batch_index = idx,
-                            stream_name = %stream_name,
-                            error = %err,
-                            "pool error"
-                        );
-
-                        batch_responses.push(Err(Status::unavailable(format!("pool error: {err}"))));
-                    }
-                },
-                Err(err) => {
-                    warn!(
-                        trace_id = %trace_id,
-                        batch_index = idx,
-                        stream_name = %stream_name,
-                        error = %err,
-                        "auth error"
-                    );
-
-                    batch_responses.push(Err(Status::unauthenticated(err.to_string())));
-                }
+            let mut append_requests = Vec::new();
+            while let Some(append_request) = request_stream.next().await {
+                append_requests.push(append_request);
             }
+
+            batch_responses = self
+                .connection_workers
+                .append_rows(append_requests, &trace_id, idx, &stream_name)
+                .await;
 
             let should_retry = should_retry_batch_responses(&batch_responses);
             if should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
@@ -1211,15 +1348,13 @@ impl StorageApi {
         Ok(batch_results)
     }
 
-    /// Invalidates all connections by incrementing the connection epoch.
+    /// Invalidates all worker connections.
     ///
-    /// Increments the connection epoch to invalidate all existing connections,
-    /// both idle and in-use. Idle connections are immediately cleared from the
-    /// pool, while in-use connections will be discarded when returned during
-    /// recycling. Call this after DDL changes to ensure all subsequent operations
-    /// use fresh connections with updated schema information.
+    /// Sends an invalidate message to each worker, which drops its current
+    /// connection and recreates it before processing subsequent requests.
+    /// Call this after DDL changes to ensure writes use fresh connections.
     pub async fn invalidate_all_connections(&self) {
-        self.connection_pool.invalidate_all().await;
+        self.connection_workers.invalidate_all().await;
     }
 
     /// Creates an authenticated gRPC request with Bearer token authorization.
@@ -1320,8 +1455,8 @@ pub mod test {
     use crate::model::table_schema::TableSchema;
     use crate::storage::{
         ensure_non_empty_batch_responses, is_retryable_append_status, normalize_append_response,
-        should_retry_batch_responses, BatchAppendResult, ColumnMode, ColumnType, ConnectionPool, FieldDescriptor,
-        StorageApi, StreamName, TableBatch, TableDescriptor, APPEND_RESPONSE_MISSING_OUTCOME_ERROR,
+        should_retry_batch_responses, BatchAppendResult, ColumnMode, ColumnType, FieldDescriptor, StorageApi,
+        StreamName, TableBatch, TableDescriptor, APPEND_RESPONSE_MISSING_OUTCOME_ERROR,
         EMPTY_APPEND_RESPONSE_STREAM_ERROR,
     };
     use crate::{env_vars, Client};
@@ -1451,28 +1586,6 @@ pub mod test {
         }
 
         Ok(num_append_rows_calls)
-    }
-
-    #[tokio::test]
-    async fn test_connection_pool() {
-        let connection_pool = ConnectionPool::new(4).await.unwrap();
-
-        // Test that we can get multiple connections from the pool
-        let client1 = connection_pool.get_client().await.unwrap();
-        let client2 = connection_pool.get_client().await.unwrap();
-
-        // Connections should be different instances but both valid
-        // Just verify they exist and are usable (we can't easily test the same connection
-        // is reused without dropping and re-acquiring)
-        assert!(std::ptr::addr_of!(*client1) != std::ptr::addr_of!(*client2));
-
-        // Drop connections to return them to the pool
-        drop(client1);
-        drop(client2);
-
-        // Get another connection to verify pool recycling works
-        let client3 = connection_pool.get_client().await.unwrap();
-        drop(client3);
     }
 
     #[tokio::test]
