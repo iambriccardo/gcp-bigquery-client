@@ -24,7 +24,7 @@ use std::{
         Arc,
     },
 };
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tonic::{
@@ -733,16 +733,16 @@ async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
 struct ConnectionWorkerState {
     worker_id: usize,
     auth: Arc<dyn Authenticator>,
-    bearer_token: Option<String>,
-    grpc_client: Option<BigQueryWriteClient<Channel>>,
+    // Cached separately so append tasks only lock auth state briefly.
+    bearer_token: Mutex<Option<String>>,
+    // Stored behind a mutex so tasks can clone the current client/channel safely.
+    grpc_client: Mutex<Option<BigQueryWriteClient<Channel>>>,
 }
 
 impl std::fmt::Debug for ConnectionWorkerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionWorkerState")
             .field("worker_id", &self.worker_id)
-            .field("has_bearer_token", &self.bearer_token.is_some())
-            .field("grpc_client", &self.grpc_client.is_some())
             .finish()
     }
 }
@@ -753,19 +753,30 @@ impl ConnectionWorkerState {
         Self {
             worker_id,
             auth,
-            bearer_token: None,
-            grpc_client: None,
+            bearer_token: Mutex::new(None),
+            grpc_client: Mutex::new(None),
         }
     }
 
+    /// Clears the cached bearer token.
+    async fn reset_bearer_token(&self) {
+        *self.bearer_token.lock().await = None;
+    }
+
+    /// Drops the current gRPC connection.
+    async fn reset_connection(&self) {
+        *self.grpc_client.lock().await = None;
+    }
+
     /// Invalidates the current connection and eagerly creates a fresh one.
-    async fn invalidate(&mut self) -> Result<(), Status> {
-        self.grpc_client = None;
-        self.bearer_token = None;
+    async fn invalidate(&self) -> Result<(), Status> {
+        self.reset_connection().await;
+        self.reset_bearer_token().await;
 
         match create_grpc_client().await {
             Ok(client) => {
-                self.grpc_client = Some(client);
+                *self.grpc_client.lock().await = Some(client);
+
                 Ok(())
             }
             Err(err) => Err(Status::unavailable(format!(
@@ -776,25 +787,28 @@ impl ConnectionWorkerState {
 }
 
 /// Ensures a worker has a cached bearer token, fetching one if needed.
-async fn ensure_worker_bearer_token(state: &mut ConnectionWorkerState) -> Result<&str, BQError> {
-    if state.bearer_token.is_none() {
+async fn ensure_worker_bearer_token(state: &ConnectionWorkerState) -> Result<String, BQError> {
+    let mut bearer_token = state.bearer_token.lock().await;
+    if bearer_token.is_none() {
         let access_token = state.auth.access_token().await?;
-        state.bearer_token = Some(format!("Bearer {access_token}"));
+        *bearer_token = Some(format!("Bearer {access_token}"));
     }
 
-    match state.bearer_token.as_deref() {
-        Some(bearer_token) => Ok(bearer_token),
+    match bearer_token.as_ref() {
+        Some(bearer_token) => Ok(bearer_token.clone()),
         None => Err(BQError::NoToken),
     }
 }
 
 #[async_trait]
 trait AppendRowsWorkerRequest: Send {
-    async fn run(self: Box<Self>, state: &mut ConnectionWorkerState);
+    async fn run(self: Box<Self>, state: Arc<ConnectionWorkerState>);
 }
 
 #[derive(Debug)]
 struct AppendRowsJob<M> {
+    worker_set: Arc<ConnectionWorkerSetInner>,
+    worker_index: usize,
     table_batch: TableBatch<M>,
     batch_index: usize,
     trace_id: String,
@@ -807,8 +821,10 @@ impl<M> AppendRowsWorkerRequest for AppendRowsJob<M>
 where
     M: Message + Send + Sync + 'static,
 {
-    async fn run(self: Box<Self>, state: &mut ConnectionWorkerState) {
+    async fn run(self: Box<Self>, state: Arc<ConnectionWorkerState>) {
         let Self {
+            worker_set,
+            worker_index,
             table_batch,
             batch_index,
             trace_id,
@@ -816,10 +832,12 @@ where
             response_tx,
         } = *self;
 
-        let result = worker_handle_table_batch_with_retry(state, table_batch, batch_index, trace_id, permit).await;
+        let result =
+            worker_handle_table_batch_with_retry(state.clone(), table_batch, batch_index, trace_id, permit).await;
         if response_tx.send(result).is_err() {
             warn!(worker_id = state.worker_id, "failed to send append result from worker");
         }
+        worker_set.decrement_inflight(worker_index);
     }
 }
 
@@ -832,20 +850,13 @@ enum ConnectionWorkerMessage {
     Close,
 }
 
-/// Returns true if a worker should recreate its connection after this error.
-fn should_recreate_worker_connection(status: &Status) -> bool {
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Internal | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown | Code::Aborted
-    ) || is_idle_stream_close_message(status.message())
-}
-
 /// Ensures a worker has an active gRPC client, creating one if needed.
-async fn ensure_worker_client(state: &mut ConnectionWorkerState) -> Result<&mut BigQueryWriteClient<Channel>, Status> {
-    if state.grpc_client.is_none() {
+async fn ensure_worker_client(state: &ConnectionWorkerState) -> Result<BigQueryWriteClient<Channel>, Status> {
+    let mut grpc_client = state.grpc_client.lock().await;
+    if grpc_client.is_none() {
         match create_grpc_client().await {
             Ok(client) => {
-                state.grpc_client = Some(client);
+                *grpc_client = Some(client);
             }
             Err(err) => {
                 return Err(Status::unavailable(format!(
@@ -855,15 +866,15 @@ async fn ensure_worker_client(state: &mut ConnectionWorkerState) -> Result<&mut 
         }
     }
 
-    match state.grpc_client.as_mut() {
-        Some(client) => Ok(client),
+    match grpc_client.as_ref() {
+        Some(client) => Ok(client.clone()),
         None => Err(Status::unavailable("worker connection unavailable")),
     }
 }
 
 /// Executes a single append attempt for a table batch on a worker connection.
 async fn worker_handle_table_batch_once<M>(
-    state: &mut ConnectionWorkerState,
+    state: Arc<ConnectionWorkerState>,
     table_batch: TableBatch<M>,
     batch_index: usize,
     stream_name: &str,
@@ -877,8 +888,9 @@ where
     let mut batch_responses = Vec::new();
 
     let request_stream = AppendRequestsStream::new(table_batch, proto_schema, bytes_sent_counter, trace_id);
-    let bearer_token = match ensure_worker_bearer_token(state).await {
-        Ok(bearer_token) => bearer_token.to_owned(),
+    // Clone auth data up front so the RPC does not hold the worker's auth lock.
+    let bearer_token = match ensure_worker_bearer_token(state.as_ref()).await {
+        Ok(bearer_token) => bearer_token,
         Err(err) => {
             warn!(
                 worker_id = state.worker_id,
@@ -910,7 +922,8 @@ where
         }
     };
 
-    let client = match ensure_worker_client(state).await {
+    // Clone the client before starting the RPC so this worker can multiplex more appends.
+    let mut client = match ensure_worker_client(state.as_ref()).await {
         Ok(client) => client,
         Err(status) => {
             batch_responses.push(Err(status));
@@ -922,7 +935,6 @@ where
 
     match append_result {
         Ok(response) => {
-            let mut recreate_connection = false;
             let mut streaming_response = response.into_inner();
 
             while let Some(response) = streaming_response.next().await {
@@ -941,11 +953,7 @@ where
                     );
 
                     if status.code() == Code::Unauthenticated {
-                        state.bearer_token = None;
-                    }
-
-                    if should_recreate_worker_connection(status) {
-                        recreate_connection = true;
+                        state.reset_bearer_token().await;
                     }
                 }
 
@@ -953,24 +961,10 @@ where
             }
 
             ensure_non_empty_batch_responses(&mut batch_responses, batch_index, stream_name);
-
-            if batch_responses
-                .iter()
-                .any(|response| matches!(response, Err(status) if should_recreate_worker_connection(status)))
-            {
-                recreate_connection = true;
-            }
-
-            if recreate_connection {
-                state.grpc_client = None;
-            }
         }
         Err(status) => {
             if status.code() == Code::Unauthenticated {
-                state.bearer_token = None;
-            }
-            if should_recreate_worker_connection(&status) {
-                state.grpc_client = None;
+                state.reset_bearer_token().await;
             }
 
             warn!(
@@ -990,7 +984,7 @@ where
 
 /// Executes a table batch on a worker connection with internal retry/backoff handling.
 async fn worker_handle_table_batch_with_retry<M>(
-    state: &mut ConnectionWorkerState,
+    state: Arc<ConnectionWorkerState>,
     table_batch: TableBatch<M>,
     batch_index: usize,
     trace_id: String,
@@ -1009,7 +1003,7 @@ where
         batch_responses.clear();
 
         batch_responses = worker_handle_table_batch_once(
-            state,
+            state.clone(),
             table_batch.clone(),
             batch_index,
             &stream_name,
@@ -1054,10 +1048,13 @@ where
 }
 
 /// Handles one worker message and returns whether the worker loop should continue.
-async fn handle_connection_worker_message(state: &mut ConnectionWorkerState, message: ConnectionWorkerMessage) -> bool {
+async fn handle_connection_worker_message(state: Arc<ConnectionWorkerState>, message: ConnectionWorkerMessage) -> bool {
     match message {
         ConnectionWorkerMessage::AppendRows(request) => {
-            request.run(state).await;
+            // Spawn per-batch tasks because one HTTP/2 connection can multiplex many append streams.
+            tokio::spawn(async move {
+                request.run(state).await;
+            });
 
             true
         }
@@ -1080,10 +1077,10 @@ async fn run_connection_worker(
     auth: Arc<dyn Authenticator>,
     mut rx: mpsc::UnboundedReceiver<ConnectionWorkerMessage>,
 ) {
-    let mut state = ConnectionWorkerState::new(worker_id, auth);
+    let state = Arc::new(ConnectionWorkerState::new(worker_id, auth));
 
     while let Some(message) = rx.recv().await {
-        if !handle_connection_worker_message(&mut state, message).await {
+        if !handle_connection_worker_message(state.clone(), message).await {
             break;
         }
     }
@@ -1095,13 +1092,59 @@ async fn run_connection_worker(
 #[derive(Debug)]
 struct ConnectionWorkerSetInner {
     senders: Vec<mpsc::UnboundedSender<ConnectionWorkerMessage>>,
+    inflight_requests: Vec<AtomicUsize>,
     next_worker: AtomicUsize,
+    request_semaphore: Arc<Semaphore>,
 }
 
 impl Drop for ConnectionWorkerSetInner {
     fn drop(&mut self) {
         for sender in &self.senders {
             let _ = sender.send(ConnectionWorkerMessage::Close);
+        }
+    }
+}
+
+impl ConnectionWorkerSetInner {
+    /// Returns the current in-flight count for a worker.
+    fn inflight(&self, worker_index: usize) -> usize {
+        self.inflight_requests[worker_index].load(Ordering::Relaxed)
+    }
+
+    /// Increments the in-flight count for a worker.
+    fn increment_inflight(&self, worker_index: usize) {
+        self.inflight_requests[worker_index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrements the in-flight count for a worker.
+    fn decrement_inflight(&self, worker_index: usize) {
+        self.inflight_requests[worker_index].fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Selects a worker using the power-of-two-choices strategy.
+    ///
+    /// This is a small improvement over pure round-robin to distribute work better
+    /// when some workers are temporarily slower or stuck. Selection stays O(1),
+    /// and the in-flight counters may be slightly stale, which is acceptable here.
+    ///
+    /// This is not optimal because it does not account for batch size or expected
+    /// retry cost, only the number of currently in-flight jobs. That is sufficient
+    /// for now and keeps dispatch cheap.
+    fn select_worker_index(&self) -> usize {
+        let worker_count = self.senders.len();
+        if worker_count <= 1 {
+            return 0;
+        }
+
+        let first_worker_index = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
+        let second_worker_index = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
+        let first_inflight = self.inflight(first_worker_index);
+        let second_inflight = self.inflight(second_worker_index);
+
+        if first_inflight <= second_inflight {
+            first_worker_index
+        } else {
+            second_worker_index
         }
     }
 }
@@ -1114,13 +1157,15 @@ struct ConnectionWorkerSet {
 
 impl ConnectionWorkerSet {
     /// Spawns a fixed number of connection workers.
-    fn new(worker_count: usize, auth: Arc<dyn Authenticator>) -> Self {
+    fn new(worker_count: usize, auth: Arc<dyn Authenticator>, max_inflight_requests: usize) -> Self {
         let worker_count = worker_count.max(1);
 
         let mut senders = Vec::with_capacity(worker_count);
+        let mut inflight_requests = Vec::with_capacity(worker_count);
         for worker_id in 0..worker_count {
             let (tx, rx) = mpsc::unbounded_channel();
             senders.push(tx);
+            inflight_requests.push(AtomicUsize::new(0));
 
             tokio::spawn(run_connection_worker(worker_id, auth.clone(), rx));
         }
@@ -1128,7 +1173,9 @@ impl ConnectionWorkerSet {
         Self {
             inner: Arc::new(ConnectionWorkerSetInner {
                 senders,
+                inflight_requests,
                 next_worker: AtomicUsize::new(0),
+                request_semaphore: Arc::new(Semaphore::new(max_inflight_requests)),
             }),
         }
     }
@@ -1139,7 +1186,6 @@ impl ConnectionWorkerSet {
         table_batch: TableBatch<M>,
         batch_index: usize,
         trace_id: String,
-        permit: OwnedSemaphorePermit,
     ) -> Result<ConnectionWorkerAppendHandle, BQError>
     where
         M: Message + Send + Sync + 'static,
@@ -1150,12 +1196,17 @@ impl ConnectionWorkerSet {
             )));
         }
 
-        let worker_index = self.inner.next_worker.fetch_add(1, Ordering::Relaxed) % self.inner.senders.len();
+        let permit = self.inner.request_semaphore.clone().acquire_owned().await?;
+        let worker_index = self.inner.select_worker_index();
         let sender = self.inner.senders[worker_index].clone();
         let stream_name = table_batch.stream_name().to_string();
+        // This tracks admitted jobs per worker, not bytes or request chunk count.
+        self.inner.increment_inflight(worker_index);
 
         let (response_tx, response_rx) = oneshot::channel();
         let message = ConnectionWorkerMessage::AppendRows(Box::new(AppendRowsJob {
+            worker_set: self.inner.clone(),
+            worker_index,
             table_batch,
             batch_index,
             trace_id,
@@ -1164,6 +1215,7 @@ impl ConnectionWorkerSet {
         }));
 
         if let Err(err) = sender.send(message) {
+            self.inner.decrement_inflight(worker_index);
             warn!(
                 worker_index,
                 batch_index,
@@ -1171,6 +1223,7 @@ impl ConnectionWorkerSet {
                 error = %err,
                 "failed to send append request to connection worker"
             );
+
             return Err(BQError::TonicStatusError(Status::unavailable(format!(
                 "connection worker send error: {err}"
             ))));
@@ -1228,8 +1281,6 @@ pub struct StorageApi {
     auth: Arc<dyn Authenticator>,
     /// Base URL for BigQuery API endpoints.
     base_url: String,
-    /// Semaphore for limiting concurrent append workflows before queueing worker jobs.
-    request_semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for StorageApi {
@@ -1237,7 +1288,6 @@ impl std::fmt::Debug for StorageApi {
         f.debug_struct("StorageApi")
             .field("connection_workers", &self.connection_workers)
             .field("base_url", &self.base_url)
-            .field("request_semaphore", &self.request_semaphore)
             .finish()
     }
 }
@@ -1246,14 +1296,12 @@ impl StorageApi {
     /// Creates a new storage API client instance with a custom configuration.
     pub(crate) async fn with_config(auth: Arc<dyn Authenticator>, config: StorageApiConfig) -> Result<Self, BQError> {
         let worker_count = config.connection_pool_size.max(1);
-        let request_semaphore = Arc::new(Semaphore::new(config.max_inflight_requests));
-        let connection_workers = ConnectionWorkerSet::new(worker_count, auth.clone());
+        let connection_workers = ConnectionWorkerSet::new(worker_count, auth.clone(), config.max_inflight_requests);
 
         Ok(Self {
             connection_workers,
             auth,
             base_url: BIG_QUERY_V2_URL.to_string(),
-            request_semaphore,
         })
     }
 
@@ -1404,10 +1452,9 @@ impl StorageApi {
 
         let mut handles = Vec::with_capacity(batches_num);
         for (idx, append_request) in append_requests.enumerate() {
-            let permit = self.request_semaphore.clone().acquire_owned().await?;
             let handle = self
                 .connection_workers
-                .append_table_batch(append_request.table_batch, idx, append_request.trace_id, permit)
+                .append_table_batch(append_request.table_batch, idx, append_request.trace_id)
                 .await?;
             handles.push(handle);
         }
