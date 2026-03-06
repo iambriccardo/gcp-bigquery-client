@@ -99,16 +99,19 @@ const MAX_APPEND_RETRY_BACKOFF_MS: u64 = 60_000;
 
 /// Returns true when a request-level status code should be retried.
 fn is_retryable_append_status(status: &Status) -> bool {
-    matches!(
-        status.code(),
+    match status.code() {
         Code::Unavailable
-            | Code::Internal
-            | Code::Aborted
-            | Code::Cancelled
-            | Code::DeadlineExceeded
-            | Code::ResourceExhausted
-            | Code::Unknown
-    ) || is_idle_stream_close_message(status.message())
+        | Code::Internal
+        | Code::Aborted
+        | Code::Cancelled
+        | Code::DeadlineExceeded
+        | Code::ResourceExhausted => true,
+        Code::Unknown => {
+            let message = status.message().to_lowercase();
+            message.contains("transport") || message.contains("connection")
+        }
+        _ => is_idle_stream_close_message(status.message()),
+    }
 }
 
 /// Returns true for the known BigQuery idle stream close message.
@@ -1216,6 +1219,7 @@ impl ConnectionWorkerSet {
 
         if let Err(err) = sender.send(message) {
             self.inner.decrement_inflight(worker_index);
+
             warn!(
                 worker_index,
                 batch_index,
@@ -1867,11 +1871,12 @@ pub mod test {
         assert!(is_retryable_append_status(&Status::deadline_exceeded("deadline")));
         assert!(is_retryable_append_status(&Status::resource_exhausted("quota")));
         assert!(is_retryable_append_status(&Status::unknown("transport error")));
-        assert!(is_retryable_append_status(&Status::unknown("some unknown cause")));
+        assert!(is_retryable_append_status(&Status::unknown("connection reset")));
         assert!(is_retryable_append_status(&Status::failed_precondition(
             "Closing the stream because it has been inactive"
         )));
 
+        assert!(!is_retryable_append_status(&Status::unknown("some unknown cause")));
         assert!(!is_retryable_append_status(&Status::invalid_argument("invalid")));
         assert!(!is_retryable_append_status(&Status::failed_precondition(
             "failed precondition"
@@ -1946,6 +1951,25 @@ pub mod test {
             )),
         };
         assert!(!should_retry_batch_responses(&[Ok(row_error_response)]));
+    }
+
+    #[test]
+    fn test_is_retryable_append_status_matches_java_managed_writer_retry_set() {
+        assert!(is_retryable_append_status(&Status::aborted("retry")));
+        assert!(is_retryable_append_status(&Status::unavailable("retry")));
+        assert!(is_retryable_append_status(&Status::cancelled("retry")));
+        assert!(is_retryable_append_status(&Status::internal("retry")));
+        assert!(is_retryable_append_status(&Status::deadline_exceeded("retry")));
+        assert!(is_retryable_append_status(&Status::resource_exhausted("retry")));
+        assert!(is_retryable_append_status(&Status::unknown("transport failure")));
+        assert!(is_retryable_append_status(&Status::unknown("connection closed")));
+
+        assert!(!is_retryable_append_status(&Status::unknown("do not retry by default")));
+        assert!(!is_retryable_append_status(&Status::invalid_argument("do not retry")));
+        assert!(!is_retryable_append_status(&Status::failed_precondition(
+            "do not retry"
+        )));
+        assert!(!is_retryable_append_status(&Status::unauthenticated("do not retry")));
     }
 
     #[test]
