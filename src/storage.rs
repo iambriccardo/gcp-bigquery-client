@@ -736,9 +736,6 @@ async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
 struct ConnectionWorkerState {
     worker_id: usize,
     auth: Arc<dyn Authenticator>,
-    // Cached separately so append tasks only lock auth state briefly.
-    bearer_token: Mutex<Option<String>>,
-    // Stored behind a mutex so tasks can clone the current client/channel safely.
     grpc_client: Mutex<Option<BigQueryWriteClient<Channel>>>,
 }
 
@@ -756,14 +753,8 @@ impl ConnectionWorkerState {
         Self {
             worker_id,
             auth,
-            bearer_token: Mutex::new(None),
             grpc_client: Mutex::new(None),
         }
-    }
-
-    /// Clears the cached bearer token.
-    async fn reset_bearer_token(&self) {
-        *self.bearer_token.lock().await = None;
     }
 
     /// Drops the current gRPC connection.
@@ -774,7 +765,6 @@ impl ConnectionWorkerState {
     /// Invalidates the current connection and eagerly creates a fresh one.
     async fn invalidate(&self) -> Result<(), Status> {
         self.reset_connection().await;
-        self.reset_bearer_token().await;
 
         match create_grpc_client().await {
             Ok(client) => {
@@ -786,20 +776,6 @@ impl ConnectionWorkerState {
                 "failed to recreate worker connection: {err}"
             ))),
         }
-    }
-}
-
-/// Ensures a worker has a cached bearer token, fetching one if needed.
-async fn ensure_worker_bearer_token(state: &ConnectionWorkerState) -> Result<String, BQError> {
-    let mut bearer_token = state.bearer_token.lock().await;
-    if bearer_token.is_none() {
-        let access_token = state.auth.access_token().await?;
-        *bearer_token = Some(format!("Bearer {access_token}"));
-    }
-
-    match bearer_token.as_ref() {
-        Some(bearer_token) => Ok(bearer_token.clone()),
-        None => Err(BQError::NoToken),
     }
 }
 
@@ -891,24 +867,7 @@ where
     let mut batch_responses = Vec::new();
 
     let request_stream = AppendRequestsStream::new(table_batch, proto_schema, bytes_sent_counter, trace_id);
-    // Clone auth data up front so the RPC does not hold the worker's auth lock.
-    let bearer_token = match ensure_worker_bearer_token(state.as_ref()).await {
-        Ok(bearer_token) => bearer_token,
-        Err(err) => {
-            warn!(
-                worker_id = state.worker_id,
-                batch_index,
-                stream_name = %stream_name,
-                error = %err,
-                "auth error in connection worker"
-            );
-
-            batch_responses.push(Err(Status::unauthenticated(err.to_string())));
-
-            return batch_responses;
-        }
-    };
-    let request = match StorageApi::new_authorized_request_with_bearer_token(bearer_token, request_stream) {
+    let request = match StorageApi::new_authorized_request(state.auth.clone(), request_stream).await {
         Ok(request) => request,
         Err(err) => {
             warn!(
@@ -954,10 +913,6 @@ where
                         error = %status,
                         "batch append error response"
                     );
-
-                    if status.code() == Code::Unauthenticated {
-                        state.reset_bearer_token().await;
-                    }
                 }
 
                 batch_responses.push(normalized_response);
@@ -966,10 +921,6 @@ where
             ensure_non_empty_batch_responses(&mut batch_responses, batch_index, stream_name);
         }
         Err(status) => {
-            if status.code() == Code::Unauthenticated {
-                state.reset_bearer_token().await;
-            }
-
             warn!(
                 worker_id = state.worker_id,
                 batch_index,
