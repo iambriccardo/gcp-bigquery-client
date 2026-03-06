@@ -4,7 +4,7 @@
 //! enabling efficient streaming of structured data to BigQuery tables.
 
 use async_trait::async_trait;
-use futures::stream::Stream;
+use futures::stream::{FuturesUnordered, Stream};
 use futures::StreamExt;
 use pin_project::pin_project;
 use prost::Message;
@@ -90,10 +90,6 @@ const HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 /// If a PING is not acknowledged within this time, the connection is
 /// considered dead.
 const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 10;
-/// Error message used when the append response stream ends without yielding any responses.
-const EMPTY_APPEND_RESPONSE_STREAM_ERROR: &str = "append response stream ended without responses";
-/// Error message used when an append response message has neither append result nor error details.
-const APPEND_RESPONSE_MISSING_OUTCOME_ERROR: &str = "append response missing append_result/error outcome";
 /// Maximum number of attempts for retryable append failures.
 const MAX_APPEND_RETRY_ATTEMPTS: u32 = 10;
 /// Initial retry backoff in milliseconds for retryable append failures.
@@ -116,6 +112,8 @@ fn is_retryable_append_status(status: &Status) -> bool {
 }
 
 /// Returns true for the known BigQuery idle stream close message.
+///
+/// This was taken from the Java BigQuery SDK.
 fn is_idle_stream_close_message(message: &str) -> bool {
     message.contains("Closing the stream because it has been inactive")
 }
@@ -145,7 +143,9 @@ fn normalize_append_response(
                 "append response missing append_result/error outcome"
             );
 
-            Err(Status::unavailable(APPEND_RESPONSE_MISSING_OUTCOME_ERROR))
+            Err(Status::unavailable(
+                "append response missing append_result/error outcome",
+            ))
         }
     }
 }
@@ -181,6 +181,7 @@ fn calculate_append_retry_backoff(attempt: u32) -> Duration {
     let exponential = INITIAL_APPEND_RETRY_BACKOFF_MS
         .saturating_mul(1u64 << attempt.min(10))
         .min(MAX_APPEND_RETRY_BACKOFF_MS);
+
     Duration::from_millis(exponential)
 }
 
@@ -200,7 +201,9 @@ fn ensure_non_empty_batch_responses(
             "append response stream ended without responses"
         );
 
-        batch_responses.push(Err(Status::unavailable(EMPTY_APPEND_RESPONSE_STREAM_ERROR)));
+        batch_responses.push(Err(Status::unavailable(
+            "append response stream ended without responses",
+        )));
     }
 }
 
@@ -250,496 +253,6 @@ impl Default for StorageApiConfig {
 }
 
 type WorkerAppendResult = Vec<Result<AppendRowsResponse, Status>>;
-
-#[derive(Debug)]
-/// Handle returned when a batch append has been accepted by a connection worker.
-struct ConnectionWorkerAppendHandle {
-    worker_index: usize,
-    batch_index: usize,
-    stream_name: String,
-    response_rx: oneshot::Receiver<BatchAppendResult>,
-}
-
-impl ConnectionWorkerAppendHandle {
-    /// Waits for the worker to finish the batch, including internal retries.
-    async fn wait(self) -> Result<BatchAppendResult, BQError> {
-        self.response_rx.await.map_err(|err| {
-            BQError::TonicStatusError(Status::unavailable(format!(
-                "connection worker response error for worker {} batch {} stream {}: {err}",
-                self.worker_index, self.batch_index, self.stream_name
-            )))
-        })
-    }
-}
-
-/// Creates a configured gRPC client for BigQuery Storage Write API.
-async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
-    // Since Tonic 0.12.0, TLS root certificates are no longer included by default.
-    // They must now be specified explicitly.
-    // See: https://github.com/hyperium/tonic/pull/1731
-    let tls_config = ClientTlsConfig::new()
-        .domain_name(BIGQUERY_STORAGE_API_DOMAIN)
-        .with_enabled_roots();
-
-    let channel = Channel::from_static(BIG_QUERY_STORAGE_API_URL)
-        .tls_config(tls_config)?
-        // Configure HTTP/2 keepalive to detect dead connections and prevent
-        // proxies from closing idle connections.
-        .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS))
-        .keep_alive_timeout(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS))
-        .keep_alive_while_idle(true)
-        .connect()
-        .await?;
-
-    Ok(BigQueryWriteClient::new(channel)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE_BYTES)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES)
-        .send_compressed(CompressionEncoding::Gzip)
-        .accept_compressed(CompressionEncoding::Gzip))
-}
-
-/// Mutable state owned by a single connection worker task.
-struct ConnectionWorkerState {
-    worker_id: usize,
-    auth: Arc<dyn Authenticator>,
-    grpc_client: Option<BigQueryWriteClient<Channel>>,
-}
-
-impl std::fmt::Debug for ConnectionWorkerState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConnectionWorkerState")
-            .field("worker_id", &self.worker_id)
-            .field("grpc_client", &self.grpc_client.is_some())
-            .finish()
-    }
-}
-
-impl ConnectionWorkerState {
-    /// Creates a new worker state with no active gRPC connection.
-    fn new(worker_id: usize, auth: Arc<dyn Authenticator>) -> Self {
-        Self {
-            worker_id,
-            auth,
-            grpc_client: None,
-        }
-    }
-
-    /// Invalidates the current connection and eagerly creates a fresh one.
-    async fn invalidate(&mut self) -> Result<(), Status> {
-        self.grpc_client = None;
-
-        match create_grpc_client().await {
-            Ok(client) => {
-                self.grpc_client = Some(client);
-                Ok(())
-            }
-            Err(err) => Err(Status::unavailable(format!(
-                "failed to recreate worker connection: {err}"
-            ))),
-        }
-    }
-}
-
-#[async_trait]
-trait AppendRowsWorkerRequest: Send {
-    async fn run(self: Box<Self>, state: &mut ConnectionWorkerState);
-}
-
-#[derive(Debug)]
-struct AppendRowsJob<M> {
-    table_batch: TableBatch<M>,
-    batch_index: usize,
-    permit: OwnedSemaphorePermit,
-    response_tx: oneshot::Sender<BatchAppendResult>,
-}
-
-#[async_trait]
-impl<M> AppendRowsWorkerRequest for AppendRowsJob<M>
-where
-    M: Message + Send + Sync + 'static,
-{
-    async fn run(self: Box<Self>, state: &mut ConnectionWorkerState) {
-        let Self {
-            table_batch,
-            batch_index,
-            permit,
-            response_tx,
-        } = *self;
-
-        let result = worker_handle_table_batch_with_retry(state, table_batch, batch_index, permit).await;
-        if response_tx.send(result).is_err() {
-            warn!(worker_id = state.worker_id, "failed to send append result from worker");
-        }
-    }
-}
-
-/// Messages sent to connection worker tasks.
-enum ConnectionWorkerMessage {
-    AppendRows(Box<dyn AppendRowsWorkerRequest>),
-    Invalidate {
-        response_tx: oneshot::Sender<Result<(), Status>>,
-    },
-    Close,
-}
-
-/// Returns true if a worker should recreate its connection after this error.
-fn should_recreate_worker_connection(status: &Status) -> bool {
-    matches!(
-        status.code(),
-        Code::Unavailable | Code::Internal | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown | Code::Aborted
-    ) || is_idle_stream_close_message(status.message())
-}
-
-/// Ensures a worker has an active gRPC client, creating one if needed.
-async fn ensure_worker_client(state: &mut ConnectionWorkerState) -> Result<&mut BigQueryWriteClient<Channel>, Status> {
-    if state.grpc_client.is_none() {
-        match create_grpc_client().await {
-            Ok(client) => {
-                state.grpc_client = Some(client);
-            }
-            Err(err) => {
-                return Err(Status::unavailable(format!(
-                    "failed to create worker connection: {err}"
-                )));
-            }
-        }
-    }
-
-    match state.grpc_client.as_mut() {
-        Some(client) => Ok(client),
-        None => Err(Status::unavailable("worker connection unavailable")),
-    }
-}
-
-/// Executes a single append attempt for a table batch on a worker connection.
-async fn worker_handle_table_batch_once<M>(
-    state: &mut ConnectionWorkerState,
-    table_batch: TableBatch<M>,
-    batch_index: usize,
-    stream_name: &str,
-    proto_schema: ProtoSchema,
-    bytes_sent_counter: Arc<AtomicUsize>,
-) -> WorkerAppendResult
-where
-    M: Message + 'static,
-{
-    let mut batch_responses = Vec::new();
-
-    let request_stream = AppendRequestsStream::new(table_batch, proto_schema, bytes_sent_counter);
-    let request = match StorageApi::new_authorized_request(state.auth.clone(), request_stream).await {
-        Ok(request) => request,
-        Err(err) => {
-            warn!(
-                worker_id = state.worker_id,
-                batch_index,
-                stream_name = %stream_name,
-                error = %err,
-                "auth error in connection worker"
-            );
-
-            batch_responses.push(Err(Status::unauthenticated(err.to_string())));
-
-            return batch_responses;
-        }
-    };
-
-    let client = match ensure_worker_client(state).await {
-        Ok(client) => client,
-        Err(status) => {
-            batch_responses.push(Err(status));
-
-            return batch_responses;
-        }
-    };
-    let append_result = client.append_rows(request).await;
-
-    match append_result {
-        Ok(response) => {
-            let mut recreate_connection = false;
-            let mut streaming_response = response.into_inner();
-
-            while let Some(response) = streaming_response.next().await {
-                let normalized_response = match response {
-                    Ok(response) => normalize_append_response(response, batch_index, stream_name),
-                    Err(status) => Err(status),
-                };
-
-                if let Err(status) = &normalized_response {
-                    warn!(
-                        worker_id = state.worker_id,
-                        batch_index,
-                        stream_name = %stream_name,
-                        error = %status,
-                        "batch append error response"
-                    );
-
-                    if should_recreate_worker_connection(status) {
-                        recreate_connection = true;
-                    }
-                }
-
-                batch_responses.push(normalized_response);
-            }
-
-            ensure_non_empty_batch_responses(&mut batch_responses, batch_index, stream_name);
-
-            if batch_responses
-                .iter()
-                .any(|response| matches!(response, Err(status) if should_recreate_worker_connection(status)))
-            {
-                recreate_connection = true;
-            }
-
-            if recreate_connection {
-                state.grpc_client = None;
-            }
-        }
-        Err(status) => {
-            if should_recreate_worker_connection(&status) {
-                state.grpc_client = None;
-            }
-
-            warn!(
-                worker_id = state.worker_id,
-                batch_index,
-                stream_name = %stream_name,
-                error = %status,
-                "failed to append batch in connection worker"
-            );
-
-            batch_responses.push(Err(status));
-        }
-    }
-
-    batch_responses
-}
-
-/// Executes a table batch on a worker connection with internal retry/backoff handling.
-async fn worker_handle_table_batch_with_retry<M>(
-    state: &mut ConnectionWorkerState,
-    table_batch: TableBatch<M>,
-    batch_index: usize,
-    _permit: OwnedSemaphorePermit,
-) -> BatchAppendResult
-where
-    M: Message + Send + Sync + 'static,
-{
-    let stream_name = table_batch.stream_name().to_string();
-    let proto_schema = StorageApi::create_proto_schema(table_batch.table_descriptor());
-    let bytes_sent_counter = Arc::new(AtomicUsize::new(0));
-    
-    let mut batch_responses = Vec::new();
-
-    for attempt in 0..MAX_APPEND_RETRY_ATTEMPTS {
-        batch_responses.clear();
-
-        batch_responses = worker_handle_table_batch_once(
-            state,
-            table_batch.clone(),
-            batch_index,
-            &stream_name,
-            proto_schema.clone(),
-            bytes_sent_counter.clone(),
-        )
-        .await;
-
-        let should_retry = should_retry_batch_responses(&batch_responses);
-        if should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
-            let backoff = calculate_append_retry_backoff(attempt);
-
-            warn!(
-                worker_id = state.worker_id,
-                batch_index,
-                stream_name = %stream_name,
-                attempt = attempt + 1,
-                max_attempts = MAX_APPEND_RETRY_ATTEMPTS,
-                backoff_ms = backoff.as_millis(),
-                "retrying batch due to retryable append errors in connection worker"
-            );
-
-            sleep(backoff).await;
-
-            continue;
-        }
-
-        break;
-    }
-
-    let bytes_sent = bytes_sent_counter.load(Ordering::Relaxed);
-    debug!(
-        worker_id = state.worker_id,
-        batch_index,
-        stream_name = %stream_name,
-        bytes_sent,
-        "batch completed in connection worker"
-    );
-
-    BatchAppendResult::new(batch_index, batch_responses, bytes_sent)
-}
-
-/// Handles one worker message and returns whether the worker loop should continue.
-async fn handle_connection_worker_message(state: &mut ConnectionWorkerState, message: ConnectionWorkerMessage) -> bool {
-    match message {
-        ConnectionWorkerMessage::AppendRows(request) => {
-            request.run(state).await;
-
-            true
-        }
-        ConnectionWorkerMessage::Invalidate { response_tx } => {
-            let result = state.invalidate().await;
-
-            if response_tx.send(result).is_err() {
-                warn!(worker_id = state.worker_id, "failed to send invalidate ack from worker");
-            }
-
-            true
-        }
-        ConnectionWorkerMessage::Close => false,
-    }
-}
-
-/// Background task loop for a single connection worker.
-async fn run_connection_worker(
-    worker_id: usize,
-    auth: Arc<dyn Authenticator>,
-    mut rx: mpsc::UnboundedReceiver<ConnectionWorkerMessage>,
-) {
-    let mut state = ConnectionWorkerState::new(worker_id, auth);
-
-    while let Some(message) = rx.recv().await {
-        if !handle_connection_worker_message(&mut state, message).await {
-            break;
-        }
-    }
-
-    debug!(worker_id, "connection worker closed");
-}
-
-/// Internal connection worker state shared across clones.
-#[derive(Debug)]
-struct ConnectionWorkerSetInner {
-    senders: Vec<mpsc::UnboundedSender<ConnectionWorkerMessage>>,
-    next_worker: AtomicUsize,
-}
-
-impl Drop for ConnectionWorkerSetInner {
-    fn drop(&mut self) {
-        for sender in &self.senders {
-            let _ = sender.send(ConnectionWorkerMessage::Close);
-        }
-    }
-}
-
-/// Shared set of long-lived connection workers.
-#[derive(Debug, Clone)]
-struct ConnectionWorkerSet {
-    inner: Arc<ConnectionWorkerSetInner>,
-}
-
-impl ConnectionWorkerSet {
-    /// Spawns a fixed number of connection workers.
-    fn new(worker_count: usize, auth: Arc<dyn Authenticator>) -> Self {
-        let worker_count = worker_count.max(1);
-
-        let mut senders = Vec::with_capacity(worker_count);
-        for worker_id in 0..worker_count {
-            let (tx, rx) = mpsc::unbounded_channel();
-            senders.push(tx);
-
-            tokio::spawn(run_connection_worker(worker_id, auth.clone(), rx));
-        }
-
-        Self {
-            inner: Arc::new(ConnectionWorkerSetInner {
-                senders,
-                next_worker: AtomicUsize::new(0),
-            }),
-        }
-    }
-
-    /// Dispatches a table batch to one worker selected in round-robin order.
-    async fn append_table_batch<M>(
-        &self,
-        table_batch: TableBatch<M>,
-        batch_index: usize,
-        permit: OwnedSemaphorePermit,
-    ) -> Result<ConnectionWorkerAppendHandle, BQError>
-    where
-        M: Message + Send + Sync + 'static,
-    {
-        if self.inner.senders.is_empty() {
-            return Err(BQError::TonicStatusError(Status::unavailable(
-                "no connection workers available",
-            )));
-        }
-
-        let worker_index = self.inner.next_worker.fetch_add(1, Ordering::Relaxed) % self.inner.senders.len();
-        let sender = self.inner.senders[worker_index].clone();
-        let stream_name = table_batch.stream_name().to_string();
-
-        let (response_tx, response_rx) = oneshot::channel();
-        let message = ConnectionWorkerMessage::AppendRows(Box::new(AppendRowsJob {
-            table_batch,
-            batch_index,
-            permit,
-            response_tx,
-        }));
-
-        if let Err(err) = sender.send(message) {
-            warn!(
-                worker_index,
-                batch_index,
-                stream_name = %stream_name,
-                error = %err,
-                "failed to send append request to connection worker"
-            );
-            return Err(BQError::TonicStatusError(Status::unavailable(format!(
-                "connection worker send error: {err}"
-            ))));
-        }
-
-        Ok(ConnectionWorkerAppendHandle {
-            worker_index,
-            batch_index,
-            stream_name,
-            response_rx,
-        })
-    }
-
-    /// Invalidates and recreates the connection in each worker.
-    async fn invalidate_all(&self) {
-        let mut join_set = JoinSet::new();
-
-        for (worker_index, sender) in self.inner.senders.iter().cloned().enumerate() {
-            join_set.spawn(async move {
-                let (response_tx, response_rx) = oneshot::channel();
-                sender
-                    .send(ConnectionWorkerMessage::Invalidate { response_tx })
-                    .map_err(|err| Status::unavailable(format!("failed to send invalidate message: {err}")))?;
-
-                response_rx
-                    .await
-                    .map_err(|err| Status::unavailable(format!("failed to receive invalidate ack: {err}")))??;
-
-                Ok::<usize, Status>(worker_index)
-            });
-        }
-
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(Ok(worker_index)) => {
-                    debug!(worker_index, "invalidated connection worker");
-                }
-                Ok(Err(status)) => {
-                    warn!(error = %status, "failed to invalidate connection worker");
-                }
-                Err(err) => {
-                    warn!(error = %err, "connection worker invalidate task failed");
-                }
-            }
-        }
-    }
-}
 
 /// Supported protobuf column types for BigQuery schema mapping.
 #[derive(Debug, Copy, Clone)]
@@ -893,6 +406,22 @@ impl<M> TableBatch<M> {
     }
 }
 
+/// A table batch paired with the trace identifier to use for its append requests.
+#[derive(Debug)]
+pub struct BatchAppendRequest<M> {
+    /// The batch to append.
+    pub table_batch: TableBatch<M>,
+    /// The trace identifier propagated to BigQuery for this logical batch.
+    pub trace_id: String,
+}
+
+impl<M> BatchAppendRequest<M> {
+    /// Creates a new batch append request.
+    pub fn new(table_batch: TableBatch<M>, trace_id: String) -> Self {
+        Self { table_batch, trace_id }
+    }
+}
+
 /// Result of processing a single table batch in concurrent append operations.
 ///
 /// Contains the batch processing results along with metadata about the operation,
@@ -993,6 +522,11 @@ impl StreamName {
             stream: DEFAULT_STREAM_NAME.to_string(),
         }
     }
+
+    /// Returns the BigQuery table identifier.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
 }
 
 impl Display for StreamName {
@@ -1037,6 +571,8 @@ pub struct AppendRequestsStream<M> {
     include_schema_next: bool,
     /// Shared atomic counter for tracking total bytes sent across all requests in this stream.
     bytes_sent_counter: Arc<AtomicUsize>,
+    /// Trace identifier propagated to all append requests in this batch.
+    trace_id: String,
 }
 
 impl<M> AppendRequestsStream<M> {
@@ -1045,13 +581,19 @@ impl<M> AppendRequestsStream<M> {
     /// Initializes the stream with all necessary metadata for generating
     /// properly formatted append requests. The schema is included only
     /// in the first request of the stream.
-    fn new(table_batch: TableBatch<M>, proto_schema: ProtoSchema, bytes_sent_counter: Arc<AtomicUsize>) -> Self {
+    fn new(
+        table_batch: TableBatch<M>,
+        proto_schema: ProtoSchema,
+        bytes_sent_counter: Arc<AtomicUsize>,
+        trace_id: String,
+    ) -> Self {
         Self {
             table_batch,
             proto_schema,
             current_index: 0,
             include_schema_next: true,
             bytes_sent_counter,
+            trace_id,
         }
     }
 }
@@ -1120,7 +662,7 @@ where
         let append_rows_request = AppendRowsRequest {
             write_stream: this.table_batch.stream_name().to_string(),
             offset: None,
-            trace_id: String::new(),
+            trace_id: this.trace_id.clone(),
             missing_value_interpretations: HashMap::new(),
             default_missing_value_interpretation: MissingValueInterpretation::Unspecified.into(),
             rows: Some(append_rows_request::Rows::ProtoRows(proto_data)),
@@ -1140,6 +682,543 @@ where
     }
 }
 
+#[derive(Debug)]
+/// Handle returned when a batch append has been accepted by a connection worker.
+struct ConnectionWorkerAppendHandle {
+    worker_index: usize,
+    batch_index: usize,
+    stream_name: String,
+    response_rx: oneshot::Receiver<BatchAppendResult>,
+}
+
+impl ConnectionWorkerAppendHandle {
+    /// Waits for the worker to finish the batch, including internal retries.
+    async fn wait(self) -> Result<BatchAppendResult, BQError> {
+        self.response_rx.await.map_err(|err| {
+            BQError::TonicStatusError(Status::unavailable(format!(
+                "connection worker response error for worker {} batch {} stream {}: {err}",
+                self.worker_index, self.batch_index, self.stream_name
+            )))
+        })
+    }
+}
+
+/// Creates a configured gRPC client for BigQuery Storage Write API.
+async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
+    // Since Tonic 0.12.0, TLS root certificates are no longer included by default.
+    // They must now be specified explicitly.
+    // See: https://github.com/hyperium/tonic/pull/1731
+    let tls_config = ClientTlsConfig::new()
+        .domain_name(BIGQUERY_STORAGE_API_DOMAIN)
+        .with_enabled_roots();
+
+    let channel = Channel::from_static(BIG_QUERY_STORAGE_API_URL)
+        .tls_config(tls_config)?
+        // Configure HTTP/2 keepalive to detect dead connections and prevent
+        // proxies from closing idle connections.
+        .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS))
+        .keep_alive_timeout(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS))
+        .keep_alive_while_idle(true)
+        .connect()
+        .await?;
+
+    Ok(BigQueryWriteClient::new(channel)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE_BYTES)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES)
+        .send_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Gzip))
+}
+
+/// Mutable state owned by a single connection worker task.
+struct ConnectionWorkerState {
+    worker_id: usize,
+    auth: Arc<dyn Authenticator>,
+    bearer_token: Option<String>,
+    grpc_client: Option<BigQueryWriteClient<Channel>>,
+}
+
+impl std::fmt::Debug for ConnectionWorkerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionWorkerState")
+            .field("worker_id", &self.worker_id)
+            .field("has_bearer_token", &self.bearer_token.is_some())
+            .field("grpc_client", &self.grpc_client.is_some())
+            .finish()
+    }
+}
+
+impl ConnectionWorkerState {
+    /// Creates a new worker state with no active gRPC connection.
+    fn new(worker_id: usize, auth: Arc<dyn Authenticator>) -> Self {
+        Self {
+            worker_id,
+            auth,
+            bearer_token: None,
+            grpc_client: None,
+        }
+    }
+
+    /// Invalidates the current connection and eagerly creates a fresh one.
+    async fn invalidate(&mut self) -> Result<(), Status> {
+        self.grpc_client = None;
+        self.bearer_token = None;
+
+        match create_grpc_client().await {
+            Ok(client) => {
+                self.grpc_client = Some(client);
+                Ok(())
+            }
+            Err(err) => Err(Status::unavailable(format!(
+                "failed to recreate worker connection: {err}"
+            ))),
+        }
+    }
+}
+
+/// Ensures a worker has a cached bearer token, fetching one if needed.
+async fn ensure_worker_bearer_token(state: &mut ConnectionWorkerState) -> Result<&str, BQError> {
+    if state.bearer_token.is_none() {
+        let access_token = state.auth.access_token().await?;
+        state.bearer_token = Some(format!("Bearer {access_token}"));
+    }
+
+    match state.bearer_token.as_deref() {
+        Some(bearer_token) => Ok(bearer_token),
+        None => Err(BQError::NoToken),
+    }
+}
+
+#[async_trait]
+trait AppendRowsWorkerRequest: Send {
+    async fn run(self: Box<Self>, state: &mut ConnectionWorkerState);
+}
+
+#[derive(Debug)]
+struct AppendRowsJob<M> {
+    table_batch: TableBatch<M>,
+    batch_index: usize,
+    trace_id: String,
+    permit: OwnedSemaphorePermit,
+    response_tx: oneshot::Sender<BatchAppendResult>,
+}
+
+#[async_trait]
+impl<M> AppendRowsWorkerRequest for AppendRowsJob<M>
+where
+    M: Message + Send + Sync + 'static,
+{
+    async fn run(self: Box<Self>, state: &mut ConnectionWorkerState) {
+        let Self {
+            table_batch,
+            batch_index,
+            trace_id,
+            permit,
+            response_tx,
+        } = *self;
+
+        let result = worker_handle_table_batch_with_retry(state, table_batch, batch_index, trace_id, permit).await;
+        if response_tx.send(result).is_err() {
+            warn!(worker_id = state.worker_id, "failed to send append result from worker");
+        }
+    }
+}
+
+/// Messages sent to connection worker tasks.
+enum ConnectionWorkerMessage {
+    AppendRows(Box<dyn AppendRowsWorkerRequest>),
+    Invalidate {
+        response_tx: oneshot::Sender<Result<(), Status>>,
+    },
+    Close,
+}
+
+/// Returns true if a worker should recreate its connection after this error.
+fn should_recreate_worker_connection(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Internal | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown | Code::Aborted
+    ) || is_idle_stream_close_message(status.message())
+}
+
+/// Ensures a worker has an active gRPC client, creating one if needed.
+async fn ensure_worker_client(state: &mut ConnectionWorkerState) -> Result<&mut BigQueryWriteClient<Channel>, Status> {
+    if state.grpc_client.is_none() {
+        match create_grpc_client().await {
+            Ok(client) => {
+                state.grpc_client = Some(client);
+            }
+            Err(err) => {
+                return Err(Status::unavailable(format!(
+                    "failed to create worker connection: {err}"
+                )));
+            }
+        }
+    }
+
+    match state.grpc_client.as_mut() {
+        Some(client) => Ok(client),
+        None => Err(Status::unavailable("worker connection unavailable")),
+    }
+}
+
+/// Executes a single append attempt for a table batch on a worker connection.
+async fn worker_handle_table_batch_once<M>(
+    state: &mut ConnectionWorkerState,
+    table_batch: TableBatch<M>,
+    batch_index: usize,
+    stream_name: &str,
+    proto_schema: ProtoSchema,
+    bytes_sent_counter: Arc<AtomicUsize>,
+    trace_id: String,
+) -> WorkerAppendResult
+where
+    M: Message + 'static,
+{
+    let mut batch_responses = Vec::new();
+
+    let request_stream = AppendRequestsStream::new(table_batch, proto_schema, bytes_sent_counter, trace_id);
+    let bearer_token = match ensure_worker_bearer_token(state).await {
+        Ok(bearer_token) => bearer_token.to_owned(),
+        Err(err) => {
+            warn!(
+                worker_id = state.worker_id,
+                batch_index,
+                stream_name = %stream_name,
+                error = %err,
+                "auth error in connection worker"
+            );
+
+            batch_responses.push(Err(Status::unauthenticated(err.to_string())));
+
+            return batch_responses;
+        }
+    };
+    let request = match StorageApi::new_authorized_request_with_bearer_token(bearer_token, request_stream) {
+        Ok(request) => request,
+        Err(err) => {
+            warn!(
+                worker_id = state.worker_id,
+                batch_index,
+                stream_name = %stream_name,
+                error = %err,
+                "auth error in connection worker"
+            );
+
+            batch_responses.push(Err(Status::unauthenticated(err.to_string())));
+
+            return batch_responses;
+        }
+    };
+
+    let client = match ensure_worker_client(state).await {
+        Ok(client) => client,
+        Err(status) => {
+            batch_responses.push(Err(status));
+
+            return batch_responses;
+        }
+    };
+    let append_result = client.append_rows(request).await;
+
+    match append_result {
+        Ok(response) => {
+            let mut recreate_connection = false;
+            let mut streaming_response = response.into_inner();
+
+            while let Some(response) = streaming_response.next().await {
+                let normalized_response = match response {
+                    Ok(response) => normalize_append_response(response, batch_index, stream_name),
+                    Err(status) => Err(status),
+                };
+
+                if let Err(status) = &normalized_response {
+                    warn!(
+                        worker_id = state.worker_id,
+                        batch_index,
+                        stream_name = %stream_name,
+                        error = %status,
+                        "batch append error response"
+                    );
+
+                    if status.code() == Code::Unauthenticated {
+                        state.bearer_token = None;
+                    }
+
+                    if should_recreate_worker_connection(status) {
+                        recreate_connection = true;
+                    }
+                }
+
+                batch_responses.push(normalized_response);
+            }
+
+            ensure_non_empty_batch_responses(&mut batch_responses, batch_index, stream_name);
+
+            if batch_responses
+                .iter()
+                .any(|response| matches!(response, Err(status) if should_recreate_worker_connection(status)))
+            {
+                recreate_connection = true;
+            }
+
+            if recreate_connection {
+                state.grpc_client = None;
+            }
+        }
+        Err(status) => {
+            if status.code() == Code::Unauthenticated {
+                state.bearer_token = None;
+            }
+            if should_recreate_worker_connection(&status) {
+                state.grpc_client = None;
+            }
+
+            warn!(
+                worker_id = state.worker_id,
+                batch_index,
+                stream_name = %stream_name,
+                error = %status,
+                "failed to append batch in connection worker"
+            );
+
+            batch_responses.push(Err(status));
+        }
+    }
+
+    batch_responses
+}
+
+/// Executes a table batch on a worker connection with internal retry/backoff handling.
+async fn worker_handle_table_batch_with_retry<M>(
+    state: &mut ConnectionWorkerState,
+    table_batch: TableBatch<M>,
+    batch_index: usize,
+    trace_id: String,
+    _permit: OwnedSemaphorePermit,
+) -> BatchAppendResult
+where
+    M: Message + Send + Sync + 'static,
+{
+    let stream_name = table_batch.stream_name().to_string();
+    let proto_schema = StorageApi::create_proto_schema(table_batch.table_descriptor());
+    let bytes_sent_counter = Arc::new(AtomicUsize::new(0));
+
+    let mut batch_responses = Vec::new();
+
+    for attempt in 0..MAX_APPEND_RETRY_ATTEMPTS {
+        batch_responses.clear();
+
+        batch_responses = worker_handle_table_batch_once(
+            state,
+            table_batch.clone(),
+            batch_index,
+            &stream_name,
+            proto_schema.clone(),
+            bytes_sent_counter.clone(),
+            trace_id.clone(),
+        )
+        .await;
+
+        let should_retry = should_retry_batch_responses(&batch_responses);
+        if should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
+            let backoff = calculate_append_retry_backoff(attempt);
+
+            warn!(
+                worker_id = state.worker_id,
+                batch_index,
+                stream_name = %stream_name,
+                attempt = attempt + 1,
+                max_attempts = MAX_APPEND_RETRY_ATTEMPTS,
+                backoff_ms = backoff.as_millis(),
+                "retrying batch due to retryable append errors in connection worker"
+            );
+
+            sleep(backoff).await;
+
+            continue;
+        }
+
+        break;
+    }
+
+    let bytes_sent = bytes_sent_counter.load(Ordering::Relaxed);
+    debug!(
+        worker_id = state.worker_id,
+        batch_index,
+        stream_name = %stream_name,
+        bytes_sent,
+        "batch completed in connection worker"
+    );
+
+    BatchAppendResult::new(batch_index, batch_responses, bytes_sent)
+}
+
+/// Handles one worker message and returns whether the worker loop should continue.
+async fn handle_connection_worker_message(state: &mut ConnectionWorkerState, message: ConnectionWorkerMessage) -> bool {
+    match message {
+        ConnectionWorkerMessage::AppendRows(request) => {
+            request.run(state).await;
+
+            true
+        }
+        ConnectionWorkerMessage::Invalidate { response_tx } => {
+            let result = state.invalidate().await;
+
+            if response_tx.send(result).is_err() {
+                warn!(worker_id = state.worker_id, "failed to send invalidate ack from worker");
+            }
+
+            true
+        }
+        ConnectionWorkerMessage::Close => false,
+    }
+}
+
+/// Background task loop for a single connection worker.
+async fn run_connection_worker(
+    worker_id: usize,
+    auth: Arc<dyn Authenticator>,
+    mut rx: mpsc::UnboundedReceiver<ConnectionWorkerMessage>,
+) {
+    let mut state = ConnectionWorkerState::new(worker_id, auth);
+
+    while let Some(message) = rx.recv().await {
+        if !handle_connection_worker_message(&mut state, message).await {
+            break;
+        }
+    }
+
+    debug!(worker_id, "connection worker closed");
+}
+
+/// Internal connection worker state shared across clones.
+#[derive(Debug)]
+struct ConnectionWorkerSetInner {
+    senders: Vec<mpsc::UnboundedSender<ConnectionWorkerMessage>>,
+    next_worker: AtomicUsize,
+}
+
+impl Drop for ConnectionWorkerSetInner {
+    fn drop(&mut self) {
+        for sender in &self.senders {
+            let _ = sender.send(ConnectionWorkerMessage::Close);
+        }
+    }
+}
+
+/// Shared set of long-lived connection workers.
+#[derive(Debug, Clone)]
+struct ConnectionWorkerSet {
+    inner: Arc<ConnectionWorkerSetInner>,
+}
+
+impl ConnectionWorkerSet {
+    /// Spawns a fixed number of connection workers.
+    fn new(worker_count: usize, auth: Arc<dyn Authenticator>) -> Self {
+        let worker_count = worker_count.max(1);
+
+        let mut senders = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            let (tx, rx) = mpsc::unbounded_channel();
+            senders.push(tx);
+
+            tokio::spawn(run_connection_worker(worker_id, auth.clone(), rx));
+        }
+
+        Self {
+            inner: Arc::new(ConnectionWorkerSetInner {
+                senders,
+                next_worker: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    /// Dispatches a table batch to one worker selected in round-robin order.
+    async fn append_table_batch<M>(
+        &self,
+        table_batch: TableBatch<M>,
+        batch_index: usize,
+        trace_id: String,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<ConnectionWorkerAppendHandle, BQError>
+    where
+        M: Message + Send + Sync + 'static,
+    {
+        if self.inner.senders.is_empty() {
+            return Err(BQError::TonicStatusError(Status::unavailable(
+                "no connection workers available",
+            )));
+        }
+
+        let worker_index = self.inner.next_worker.fetch_add(1, Ordering::Relaxed) % self.inner.senders.len();
+        let sender = self.inner.senders[worker_index].clone();
+        let stream_name = table_batch.stream_name().to_string();
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let message = ConnectionWorkerMessage::AppendRows(Box::new(AppendRowsJob {
+            table_batch,
+            batch_index,
+            trace_id,
+            permit,
+            response_tx,
+        }));
+
+        if let Err(err) = sender.send(message) {
+            warn!(
+                worker_index,
+                batch_index,
+                stream_name = %stream_name,
+                error = %err,
+                "failed to send append request to connection worker"
+            );
+            return Err(BQError::TonicStatusError(Status::unavailable(format!(
+                "connection worker send error: {err}"
+            ))));
+        }
+
+        Ok(ConnectionWorkerAppendHandle {
+            worker_index,
+            batch_index,
+            stream_name,
+            response_rx,
+        })
+    }
+
+    /// Invalidates and recreates the connection in each worker.
+    async fn invalidate_all(&self) {
+        let mut join_set = JoinSet::new();
+
+        for (worker_index, sender) in self.inner.senders.iter().cloned().enumerate() {
+            join_set.spawn(async move {
+                let (response_tx, response_rx) = oneshot::channel();
+                sender
+                    .send(ConnectionWorkerMessage::Invalidate { response_tx })
+                    .map_err(|err| Status::unavailable(format!("failed to send invalidate message: {err}")))?;
+
+                response_rx
+                    .await
+                    .map_err(|err| Status::unavailable(format!("failed to receive invalidate ack: {err}")))??;
+
+                Ok::<usize, Status>(worker_index)
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(worker_index)) => {
+                    debug!(worker_index, "invalidated connection worker");
+                }
+                Ok(Err(status)) => {
+                    warn!(error = %status, "failed to invalidate connection worker");
+                }
+                Err(err) => {
+                    warn!(error = %err, "connection worker invalidate task failed");
+                }
+            }
+        }
+    }
+}
+
 /// High-level client for BigQuery Storage Write API operations.
 #[derive(Clone)]
 pub struct StorageApi {
@@ -1151,6 +1230,16 @@ pub struct StorageApi {
     base_url: String,
     /// Semaphore for limiting concurrent append workflows before queueing worker jobs.
     request_semaphore: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for StorageApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageApi")
+            .field("connection_workers", &self.connection_workers)
+            .field("base_url", &self.base_url)
+            .field("request_semaphore", &self.request_semaphore)
+            .finish()
+    }
 }
 
 impl StorageApi {
@@ -1264,13 +1353,14 @@ impl StorageApi {
         &mut self,
         stream_name: &StreamName,
         rows: append_rows_request::Rows,
+        trace_id: String,
     ) -> Result<Streaming<AppendRowsResponse>, BQError> {
         let stream_name_str = stream_name.to_string();
 
         let append_rows_request = AppendRowsRequest {
             write_stream: stream_name_str.clone(),
             offset: None,
-            trace_id: String::new(),
+            trace_id,
             missing_value_interpretations: HashMap::new(),
             default_missing_value_interpretation: MissingValueInterpretation::Unspecified.into(),
             rows: Some(rows),
@@ -1299,37 +1389,37 @@ impl StorageApi {
     ///
     /// Each table batch will result in its own AppendRequests gRPC request and if a batch exceeds
     /// the limit of 10mb, it will be split into multiple requests automatically.
-    pub async fn append_table_batches<M, I>(&self, table_batches: I) -> Result<Vec<BatchAppendResult>, BQError>
+    pub async fn append_table_batches<M, I>(&self, append_requests: I) -> Result<Vec<BatchAppendResult>, BQError>
     where
         M: Message + Send + Sync + 'static,
-        I: IntoIterator<Item = TableBatch<M>>,
+        I: IntoIterator<Item = BatchAppendRequest<M>>,
         I::IntoIter: ExactSizeIterator,
     {
-        let table_batches = table_batches.into_iter();
-        let batches_num = table_batches.len();
+        let append_requests = append_requests.into_iter();
+        let batches_num = append_requests.len();
 
         if batches_num == 0 {
             return Ok(Vec::new());
         }
 
         let mut handles = Vec::with_capacity(batches_num);
-        for (idx, table_batch) in table_batches.enumerate() {
+        for (idx, append_request) in append_requests.enumerate() {
             let permit = self.request_semaphore.clone().acquire_owned().await?;
             let handle = self
                 .connection_workers
-                .append_table_batch(table_batch, idx, permit)
+                .append_table_batch(append_request.table_batch, idx, append_request.trace_id, permit)
                 .await?;
             handles.push(handle);
         }
 
-        let mut join_set = JoinSet::new();
+        let mut pending_results = FuturesUnordered::new();
         for handle in handles {
-            join_set.spawn(async move { handle.wait().await });
+            pending_results.push(handle.wait());
         }
 
         let mut batch_results = Vec::with_capacity(batches_num);
-        while let Some(batch_result) = join_set.join_next().await {
-            batch_results.push(batch_result??);
+        while let Some(batch_result) = pending_results.next().await {
+            batch_results.push(batch_result?);
         }
 
         Ok(batch_results)
@@ -1352,6 +1442,12 @@ impl StorageApi {
     async fn new_authorized_request<T>(auth: Arc<dyn Authenticator>, message: T) -> Result<Request<T>, BQError> {
         let access_token = auth.access_token().await?;
         let bearer_token = format!("Bearer {access_token}");
+
+        Self::new_authorized_request_with_bearer_token(bearer_token, message)
+    }
+
+    /// Creates an authenticated gRPC request with a precomputed Bearer token.
+    fn new_authorized_request_with_bearer_token<T>(bearer_token: String, message: T) -> Result<Request<T>, BQError> {
         let bearer_value = bearer_token.as_str().try_into()?;
 
         let mut request = Request::new(message);
@@ -1442,9 +1538,8 @@ pub mod test {
     use crate::model::table_schema::TableSchema;
     use crate::storage::{
         ensure_non_empty_batch_responses, is_retryable_append_status, normalize_append_response,
-        should_retry_batch_responses, BatchAppendResult, ColumnMode, ColumnType, FieldDescriptor, StorageApi,
-        StreamName, TableBatch, TableDescriptor, APPEND_RESPONSE_MISSING_OUTCOME_ERROR,
-        EMPTY_APPEND_RESPONSE_STREAM_ERROR,
+        should_retry_batch_responses, BatchAppendRequest, BatchAppendResult, ColumnMode, ColumnType, FieldDescriptor,
+        StorageApi, StreamName, TableBatch, TableDescriptor,
     };
     use crate::{env_vars, Client};
 
@@ -1551,7 +1646,10 @@ pub mod test {
         let mut num_append_rows_calls = 0;
         loop {
             let (encoded_rows, num_processed) = StorageApi::create_rows(table_descriptor, rows, max_size);
-            let mut streaming = client.storage_mut().append_rows(stream_name, encoded_rows).await?;
+            let mut streaming = client
+                .storage_mut()
+                .append_rows(stream_name, encoded_rows, "test-trace-id".to_string())
+                .await?;
 
             num_append_rows_calls += 1;
 
@@ -1640,7 +1738,15 @@ pub mod test {
         let table_batches = vec![batch1, batch2, batch3];
 
         // Test that all batches are processed using the default max_concurrent_requests from config.
-        let batch_responses = client.storage_mut().append_table_batches(table_batches).await.unwrap();
+        let batch_responses = client
+            .storage_mut()
+            .append_table_batches(
+                table_batches
+                    .into_iter()
+                    .map(|table_batch| BatchAppendRequest::new(table_batch, "test-trace-id".to_string())),
+            )
+            .await
+            .unwrap();
 
         // We expect 3 responses per batch (one for each batch)
         assert_eq!(batch_responses.len(), 3);
@@ -1688,7 +1794,7 @@ pub mod test {
             .expect("missing inserted error")
             .expect_err("expected request error");
         assert_eq!(err.code(), tonic::Code::Unavailable);
-        assert_eq!(err.message(), EMPTY_APPEND_RESPONSE_STREAM_ERROR);
+        assert_eq!(err.message(), "append response stream ended without responses");
     }
 
     #[test]
@@ -1759,7 +1865,7 @@ pub mod test {
         );
         let status = normalized.expect_err("expected missing outcome to be error");
         assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert_eq!(status.message(), APPEND_RESPONSE_MISSING_OUTCOME_ERROR);
+        assert_eq!(status.message(), "append response missing append_result/error outcome");
     }
 
     #[test]
