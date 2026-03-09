@@ -780,6 +780,19 @@ impl ConnectionWorkerState {
     }
 }
 
+/// Decrements the in-flight count for a worker when dropped.
+#[derive(Debug)]
+struct InflightGuard {
+    worker_set: Arc<ConnectionWorkerSetInner>,
+    worker_index: usize,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.worker_set.decrement_inflight(self.worker_index);
+    }
+}
+
 #[async_trait]
 trait AppendRowsWorkerRequest: Send {
     async fn run(self: Box<Self>, state: Arc<ConnectionWorkerState>);
@@ -787,13 +800,12 @@ trait AppendRowsWorkerRequest: Send {
 
 #[derive(Debug)]
 struct AppendRowsJob<M> {
-    worker_set: Arc<ConnectionWorkerSetInner>,
-    worker_index: usize,
     table_batch: TableBatch<M>,
     batch_index: usize,
     trace_id: String,
-    permit: OwnedSemaphorePermit,
     response_tx: oneshot::Sender<BatchAppendResult>,
+    _permit: OwnedSemaphorePermit,
+    _inflight_guard: InflightGuard,
 }
 
 #[async_trait]
@@ -802,27 +814,15 @@ where
     M: Message + Send + Sync + 'static,
 {
     async fn run(self: Box<Self>, state: Arc<ConnectionWorkerState>) {
-        let Self {
-            worker_set,
-            worker_index,
-            table_batch,
-            batch_index,
-            trace_id,
-            permit,
-            response_tx,
-        } = *self;
-
         let worker_id = state.worker_id;
-        let result = worker_handle_table_batch_with_retry(state, table_batch, batch_index, trace_id, permit).await;
+        let result =
+            worker_handle_table_batch_with_retry(state, self.table_batch, self.batch_index, self.trace_id).await;
 
-        // We send back the result one we finish handling the batch.
-        if response_tx.send(result).is_err() {
+        // We send back the result once we finish handling the batch.
+        if self.response_tx.send(result).is_err() {
             warn!(worker_id, "failed to send append result from worker");
         }
-
-        // We have to decrement the inflight requests count once we finished, to properly allow the
-        // system to load balance.
-        worker_set.decrement_inflight(worker_index);
+        // self drops here: response_tx first, then _permit, then _inflight_guard.
     }
 }
 
@@ -948,7 +948,6 @@ async fn worker_handle_table_batch_with_retry<M>(
     table_batch: TableBatch<M>,
     batch_index: usize,
     trace_id: String,
-    _permit: OwnedSemaphorePermit,
 ) -> BatchAppendResult
 where
     M: Message + Send + Sync + 'static,
@@ -1100,6 +1099,15 @@ impl ConnectionWorkerSetInner {
         self.inflight_requests[worker_index].fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Increments the in-flight count for a worker and returns a guard that decrements it on drop.
+    fn inflight_guard(self: &Arc<Self>, worker_index: usize) -> InflightGuard {
+        self.increment_inflight(worker_index);
+        InflightGuard {
+            worker_set: Arc::clone(self),
+            worker_index,
+        }
+    }
+
     /// Selects a worker using the power-of-two-choices strategy.
     ///
     /// This is a small improvement over pure round-robin to distribute work better
@@ -1184,23 +1192,19 @@ impl ConnectionWorkerSet {
         let stream_name = table_batch.stream_name().to_string();
 
         // This tracks admitted jobs per worker, not bytes or request chunk count.
-        self.inner.increment_inflight(worker_index);
+        let inflight_guard = self.inner.inflight_guard(worker_index);
 
         let (response_tx, response_rx) = oneshot::channel();
         let message = ConnectionWorkerMessage::AppendRows(Box::new(AppendRowsJob {
-            worker_set: self.inner.clone(),
-            worker_index,
             table_batch,
             batch_index,
             trace_id,
-            permit,
             response_tx,
+            _permit: permit,
+            _inflight_guard: inflight_guard,
         }));
 
         if let Err(err) = sender.send(message).await {
-            // We have to decrement if the send failed, since no work will be done.
-            self.inner.decrement_inflight(worker_index);
-
             warn!(
                 worker_index,
                 batch_index,
