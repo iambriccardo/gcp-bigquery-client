@@ -1188,7 +1188,12 @@ impl ConnectionWorkerSet {
 
         // We first check if we are allowed to enqueue a new append requests operation to make sure
         // we don't surpass the total inflight requests limit.
-        let permit = self.inner.max_inflight_requests_semaphore.clone().acquire_owned().await?;
+        let permit = self
+            .inner
+            .max_inflight_requests_semaphore
+            .clone()
+            .acquire_owned()
+            .await?;
 
         // We obtain the worker index to which the request will be dispatched, and we track the inflight
         // request in the worker, which will be useful for load balancing.
