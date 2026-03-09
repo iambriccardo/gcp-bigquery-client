@@ -1068,7 +1068,7 @@ struct ConnectionWorkerSetInner {
     senders: Vec<mpsc::Sender<ConnectionWorkerMessage>>,
     inflight_requests: Vec<AtomicUsize>,
     next_worker: AtomicUsize,
-    request_semaphore: Arc<Semaphore>,
+    max_inflight_requests_semaphore: Arc<Semaphore>,
 }
 
 impl Drop for ConnectionWorkerSetInner {
@@ -1165,7 +1165,7 @@ impl ConnectionWorkerSet {
                 senders,
                 inflight_requests,
                 next_worker: AtomicUsize::new(0),
-                request_semaphore: Arc::new(Semaphore::new(max_inflight_requests)),
+                max_inflight_requests_semaphore: Arc::new(Semaphore::new(max_inflight_requests)),
             }),
         }
     }
@@ -1186,13 +1186,17 @@ impl ConnectionWorkerSet {
             )));
         }
 
-        let permit = self.inner.request_semaphore.clone().acquire_owned().await?;
+        // We first check if we are allowed to enqueue a new append requests operation to make sure
+        // we don't surpass the total inflight requests limit.
+        let permit = self.inner.max_inflight_requests_semaphore.clone().acquire_owned().await?;
+
+        // We obtain the worker index to which the request will be dispatched, and we track the inflight
+        // request in the worker, which will be useful for load balancing.
         let worker_index = self.inner.select_worker_index();
+        let inflight_guard = self.inner.inflight_guard(worker_index);
+
         let sender = self.inner.senders[worker_index].clone();
         let stream_name = table_batch.stream_name().to_string();
-
-        // This tracks admitted jobs per worker, not bytes or request chunk count.
-        let inflight_guard = self.inner.inflight_guard(worker_index);
 
         let (response_tx, response_rx) = oneshot::channel();
         let message = ConnectionWorkerMessage::AppendRows(Box::new(AppendRowsJob {
