@@ -1075,6 +1075,8 @@ struct ConnectionWorkerSetInner {
 impl Drop for ConnectionWorkerSetInner {
     fn drop(&mut self) {
         for sender in &self.senders {
+            // When the connection workers receive this message, they are expected to terminate as
+            // quickly as possible.
             if let Err(err) = sender.try_send(ConnectionWorkerMessage::Close) {
                 warn!(error = %err, "failed to close connection worker on worker set drop");
             }
@@ -1113,6 +1115,9 @@ impl ConnectionWorkerSetInner {
             return 0;
         }
 
+        // This path has a race condition, but it's fine for the sake of the worker selection since
+        // in the worst case it could lead to non-contiguous workers being chosen which is still fine
+        // for the selection strategy that we are using.
         let first_worker_index = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
         let second_worker_index = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
         let first_inflight = self.inflight(first_worker_index);
@@ -1368,9 +1373,9 @@ impl StorageApi {
             .get_write_stream(request)
             .await
             .map(|resp| resp.into_inner())
-            .map_err(|e| {
-                warn!(stream_name = %stream_name_str, error = %e, "failed to fetch write stream metadata");
-                e.into()
+            .map_err(|err| {
+                warn!(stream_name = %stream_name_str, error = %err, "failed to fetch write stream metadata");
+                err.into()
             })
     }
 
@@ -1403,9 +1408,9 @@ impl StorageApi {
             .append_rows(request)
             .await
             .map(|resp| resp.into_inner())
-            .map_err(|e| {
-                warn!(stream_name = %stream_name_str, error = %e, "failed to append rows");
-                e.into()
+            .map_err(|err| {
+                warn!(stream_name = %stream_name_str, error = %err, "failed to append rows");
+                err.into()
             })
     }
 
