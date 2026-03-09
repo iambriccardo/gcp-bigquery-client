@@ -73,6 +73,11 @@ const DEFAULT_STREAM_NAME: &str = "_default";
 /// support 1-10+ MBps throughput. Multiple connections provide fault isolation
 /// rather than increased parallelism.
 const DEFAULT_CONNECTION_POOL_SIZE: usize = 4;
+/// Per-worker channel capacity for handing off jobs to connection workers.
+///
+/// This is intentionally small because the global semaphore is the primary
+/// backpressure mechanism. The worker channel is only a bounded handoff queue.
+const CONNECTION_WORKER_CHANNEL_CAPACITY: usize = 4;
 
 /// Default maximum inflight requests per connection.
 ///
@@ -161,22 +166,18 @@ fn normalize_append_response(
 ///
 /// Row-level errors are considered permanent and are not retried.
 fn should_retry_batch_responses(batch_responses: &[Result<AppendRowsResponse, Status>]) -> bool {
-    let mut saw_retryable_error = false;
-
     for response in batch_responses {
         match response {
             Ok(_) => return false,
             Err(status) => {
-                if is_retryable_append_status(status) {
-                    saw_retryable_error = true;
-                } else {
+                if !is_retryable_append_status(status) {
                     return false;
                 }
             }
         }
     }
 
-    saw_retryable_error
+    true
 }
 
 /// Calculates exponential backoff for append retries.
@@ -413,9 +414,9 @@ impl<M> TableBatch<M> {
 #[derive(Debug)]
 pub struct BatchAppendRequest<M> {
     /// The batch to append.
-    pub table_batch: TableBatch<M>,
+    table_batch: TableBatch<M>,
     /// The trace identifier propagated to BigQuery for this logical batch.
-    pub trace_id: String,
+    trace_id: String,
 }
 
 impl<M> BatchAppendRequest<M> {
@@ -699,7 +700,7 @@ impl ConnectionWorkerAppendHandle {
     async fn wait(self) -> Result<BatchAppendResult, BQError> {
         self.response_rx.await.map_err(|err| {
             BQError::TonicStatusError(Status::unavailable(format!(
-                "connection worker response error for worker {} batch {} stream {}: {err}",
+                "connection worker response error for worker {} batch {} stream {:?}: {err}",
                 self.worker_index, self.batch_index, self.stream_name
             )))
         })
@@ -811,11 +812,16 @@ where
             response_tx,
         } = *self;
 
-        let result =
-            worker_handle_table_batch_with_retry(state.clone(), table_batch, batch_index, trace_id, permit).await;
+        let worker_id = state.worker_id;
+        let result = worker_handle_table_batch_with_retry(state, table_batch, batch_index, trace_id, permit).await;
+
+        // We send back the result one we finish handling the batch.
         if response_tx.send(result).is_err() {
-            warn!(worker_id = state.worker_id, "failed to send append result from worker");
+            warn!(worker_id, "failed to send append result from worker");
         }
+
+        // We have to decrement the inflight requests count once we finished, to properly allow the
+        // system to load balance.
         worker_set.decrement_inflight(worker_index);
     }
 }
@@ -1001,41 +1007,56 @@ where
     BatchAppendResult::new(batch_index, batch_responses, bytes_sent)
 }
 
-/// Handles one worker message and returns whether the worker loop should continue.
-async fn handle_connection_worker_message(state: Arc<ConnectionWorkerState>, message: ConnectionWorkerMessage) -> bool {
-    match message {
-        ConnectionWorkerMessage::AppendRows(request) => {
-            // Spawn per-batch tasks because one HTTP/2 connection can multiplex many append streams.
-            tokio::spawn(async move {
-                request.run(state).await;
-            });
-
-            true
-        }
-        ConnectionWorkerMessage::Invalidate { response_tx } => {
-            let result = state.invalidate().await;
-
-            if response_tx.send(result).is_err() {
-                warn!(worker_id = state.worker_id, "failed to send invalidate ack from worker");
-            }
-
-            true
-        }
-        ConnectionWorkerMessage::Close => false,
-    }
-}
-
 /// Background task loop for a single connection worker.
 async fn run_connection_worker(
     worker_id: usize,
     auth: Arc<dyn Authenticator>,
-    mut rx: mpsc::UnboundedReceiver<ConnectionWorkerMessage>,
+    mut rx: mpsc::Receiver<ConnectionWorkerMessage>,
 ) {
     let state = Arc::new(ConnectionWorkerState::new(worker_id, auth));
+    let mut worker_tasks = JoinSet::new();
+    let mut should_close = false;
 
-    while let Some(message) = rx.recv().await {
-        if !handle_connection_worker_message(state.clone(), message).await {
-            break;
+    while !should_close {
+        tokio::select! {
+            biased;
+
+            Some(result) = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
+                if let Err(err) = result {
+                    warn!(worker_id, error = %err, "connection worker task failed");
+                }
+            }
+
+            message = rx.recv() => {
+                match message {
+                    Some(ConnectionWorkerMessage::AppendRows(request)) => {
+                        // Spawn per-batch tasks because one HTTP/2 connection can multiplex many append streams.
+                        let task_state = state.clone();
+                        worker_tasks.spawn(async move {
+                            request.run(task_state).await;
+                        });
+                    }
+                    Some(ConnectionWorkerMessage::Invalidate { response_tx }) => {
+                        let worker_id = state.worker_id;
+                        let result = state.invalidate().await;
+                        if response_tx.send(result).is_err() {
+                            warn!(worker_id, "failed to send invalidate ack from worker");
+                        }
+                    }
+                    Some(ConnectionWorkerMessage::Close) | None => {
+                        should_close = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Before shutting down, we abort all tasks and wait for them to finish to avoid having tasks
+    // outlive the worker.
+    worker_tasks.abort_all();
+    while let Some(result) = worker_tasks.join_next().await {
+        if let Err(err) = result {
+            debug!(worker_id, error = %err, "connection worker task terminated during shutdown");
         }
     }
 
@@ -1045,7 +1066,7 @@ async fn run_connection_worker(
 /// Internal connection worker state shared across clones.
 #[derive(Debug)]
 struct ConnectionWorkerSetInner {
-    senders: Vec<mpsc::UnboundedSender<ConnectionWorkerMessage>>,
+    senders: Vec<mpsc::Sender<ConnectionWorkerMessage>>,
     inflight_requests: Vec<AtomicUsize>,
     next_worker: AtomicUsize,
     request_semaphore: Arc<Semaphore>,
@@ -1054,7 +1075,9 @@ struct ConnectionWorkerSetInner {
 impl Drop for ConnectionWorkerSetInner {
     fn drop(&mut self) {
         for sender in &self.senders {
-            let _ = sender.send(ConnectionWorkerMessage::Close);
+            if let Err(err) = sender.try_send(ConnectionWorkerMessage::Close) {
+                warn!(error = %err, "failed to close connection worker on worker set drop");
+            }
         }
     }
 }
@@ -1117,7 +1140,7 @@ impl ConnectionWorkerSet {
         let mut senders = Vec::with_capacity(worker_count);
         let mut inflight_requests = Vec::with_capacity(worker_count);
         for worker_id in 0..worker_count {
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(CONNECTION_WORKER_CHANNEL_CAPACITY);
             senders.push(tx);
             inflight_requests.push(AtomicUsize::new(0));
 
@@ -1154,6 +1177,7 @@ impl ConnectionWorkerSet {
         let worker_index = self.inner.select_worker_index();
         let sender = self.inner.senders[worker_index].clone();
         let stream_name = table_batch.stream_name().to_string();
+
         // This tracks admitted jobs per worker, not bytes or request chunk count.
         self.inner.increment_inflight(worker_index);
 
@@ -1168,7 +1192,8 @@ impl ConnectionWorkerSet {
             response_tx,
         }));
 
-        if let Err(err) = sender.send(message) {
+        if let Err(err) = sender.send(message).await {
+            // We have to decrement if the send failed, since no work will be done.
             self.inner.decrement_inflight(worker_index);
 
             warn!(
@@ -1201,6 +1226,7 @@ impl ConnectionWorkerSet {
                 let (response_tx, response_rx) = oneshot::channel();
                 sender
                     .send(ConnectionWorkerMessage::Invalidate { response_tx })
+                    .await
                     .map_err(|err| Status::unavailable(format!("failed to send invalidate message: {err}")))?;
 
                 response_rx
