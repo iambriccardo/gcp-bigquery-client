@@ -411,7 +411,7 @@ impl<M> TableBatch<M> {
 }
 
 /// A table batch paired with the trace identifier to use for its append requests.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BatchAppendRequest<M> {
     /// The batch to append.
     table_batch: TableBatch<M>,
@@ -423,6 +423,15 @@ impl<M> BatchAppendRequest<M> {
     /// Creates a new batch append request.
     pub fn new(table_batch: TableBatch<M>, trace_id: String) -> Self {
         Self { table_batch, trace_id }
+    }
+}
+
+impl<M> Clone for BatchAppendRequest<M> {
+    fn clone(&self) -> Self {
+        Self {
+            table_batch: self.table_batch.clone(),
+            trace_id: self.trace_id.clone(),
+        }
     }
 }
 
