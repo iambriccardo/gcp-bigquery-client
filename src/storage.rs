@@ -427,7 +427,6 @@ impl<M> BatchAppendRequest<M> {
 }
 
 impl<M> Clone for BatchAppendRequest<M> {
-
     fn clone(&self) -> Self {
         Self {
             table_batch: self.table_batch.clone(),
