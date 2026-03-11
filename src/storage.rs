@@ -411,7 +411,7 @@ impl<M> TableBatch<M> {
 }
 
 /// A table batch paired with the trace identifier to use for its append requests.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchAppendRequest<M> {
     /// The batch to append.
     table_batch: TableBatch<M>,
