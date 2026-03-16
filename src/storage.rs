@@ -113,17 +113,45 @@ fn is_retryable_append_status(status: &Status) -> bool {
         | Code::ResourceExhausted => true,
         Code::Unknown => {
             let message = status.message().to_lowercase();
+
             message.contains("transport") || message.contains("connection")
         }
-        _ => is_idle_stream_close_message(status.message()),
+        _ => is_retryable_stream_close_message(status.message()),
     }
 }
 
-/// Returns true for the known BigQuery idle stream close message.
+/// Returns true for known BigQuery stream close messages that require a reconnect.
 ///
 /// This was taken from the Java BigQuery SDK.
-fn is_idle_stream_close_message(message: &str) -> bool {
-    message.contains("Closing the stream because it has been inactive")
+fn is_retryable_stream_close_message(message: &str) -> bool {
+    let message = message.to_lowercase();
+
+    message.contains("closing the stream because it has been inactive")
+        || message.contains("closing the stream because server is restarted")
+        || message.contains("closing the stream because the server is restarted")
+}
+
+/// Returns true when a terminal append stream failure should drop the cached gRPC connection.
+///
+/// This mirrors the connection-level retry split in the Java BigQuery Storage Write client:
+/// request-level append errors may be retried without reconnecting, while terminal stream
+/// failures require creating a fresh connection before the next attempt.
+fn should_reset_worker_connection_for_terminal_status(status: &Status) -> bool {
+    match status.code() {
+        Code::Unavailable
+        | Code::Internal
+        | Code::Aborted
+        | Code::Cancelled
+        | Code::DeadlineExceeded
+        | Code::Unknown => true,
+        _ => is_retryable_stream_close_message(status.message()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchResponseDecision {
+    should_retry: bool,
+    should_reset_connection: bool,
 }
 
 /// Converts a [`google.rpc.Status`] from in-stream append responses into tonic [`Status`].
@@ -158,26 +186,45 @@ fn normalize_append_response(
     }
 }
 
-/// Returns true when a batch should be retried based on response outcomes.
+/// Returns the retry/reset decisions implied by a batch's response outcomes.
 ///
-/// Retries occur only when all responses are retryable request-level errors.
-/// This avoids replaying already-acknowledged successful appends in mixed
-/// partial-success/partial-failure attempts.
+/// Retry and reconnect are intentionally simple at the batch level:
+/// - retry is enabled when any response is a retryable append failure and no response is a
+///   non-retryable failure;
+/// - connection reset is enabled when any response indicates a terminal stream failure.
+///
+/// This means mixed success/failure attempts are still retried as whole batches. That can replay
+/// already-acknowledged appends and is suitable only for idempotent write paths or systems with
+/// downstream deduplication/upsert semantics.
 ///
 /// Row-level errors are considered permanent and are not retried.
-fn should_retry_batch_responses(batch_responses: &[Result<AppendRowsResponse, Status>]) -> bool {
+fn classify_batch_responses(batch_responses: &[Result<AppendRowsResponse, Status>]) -> BatchResponseDecision {
+    let mut should_reset_connection = false;
+    let mut saw_retryable_error = false;
+    let mut saw_non_retryable_error = false;
+
     for response in batch_responses {
-        match response {
-            Ok(_) => return false,
-            Err(status) => {
-                if !is_retryable_append_status(status) {
-                    return false;
-                }
-            }
+        let Err(status) = response else {
+            continue;
+        };
+
+        should_reset_connection |= should_reset_worker_connection_for_terminal_status(status);
+
+        if is_retryable_append_status(status) {
+            saw_retryable_error = true;
+        } else {
+            saw_non_retryable_error = true;
+        }
+
+        if should_reset_connection && saw_non_retryable_error {
+            break;
         }
     }
 
-    true
+    BatchResponseDecision {
+        should_retry: saw_retryable_error && !saw_non_retryable_error,
+        should_reset_connection,
+    }
 }
 
 /// Calculates exponential backoff for append retries.
@@ -981,8 +1028,30 @@ where
         )
         .await;
 
-        let should_retry = should_retry_batch_responses(&batch_responses);
-        if should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
+        // We make a decision on the batch responses on how to handle the results.
+        let decision = classify_batch_responses(&batch_responses);
+
+        // When we are instructed to reset the connection, it will be cleared and re-created on
+        // the next connection request.
+        if decision.should_reset_connection {
+            warn!(
+                worker_id = state.worker_id,
+                batch_index,
+                stream_name = %stream_name,
+                attempt = attempt + 1,
+                "resetting worker connection after append stream termination"
+            );
+
+            state.reset_connection().await;
+        }
+
+        // When we are instructed to retry the request, it will be retried if the limit was not
+        // reached.
+        //
+        // For now, we retry the entire table batch under the assumption that re-delivery of a batch
+        // is not a big deal for most use cases, but if it starts becoming a problem, a more granular
+        // retry strategy could be implemented.
+        if decision.should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
             let backoff = calculate_append_retry_backoff(attempt);
 
             warn!(
@@ -1445,6 +1514,12 @@ impl StorageApi {
     ///
     /// Each table batch will result in its own AppendRequests gRPC request and if a batch exceeds
     /// the limit of 10mb, it will be split into multiple requests automatically.
+    ///
+    /// Retryable failures are retried at the whole-batch level after reconnecting worker
+    /// connections when needed. This can replay rows that may already have been committed, so
+    /// callers should use idempotent writes, downstream deduplication, or offset-based streams
+    /// when duplicate-sensitive behavior matters. If more granular replay control is ever needed,
+    /// this can be evolved into request-level retries instead of replaying the whole batch.
     pub async fn append_table_batches<M, I>(&self, append_requests: I) -> Result<Vec<BatchAppendResult>, BQError>
     where
         M: Message + Send + Sync + 'static,
@@ -1592,9 +1667,10 @@ pub mod test {
     use crate::model::table_field_schema::TableFieldSchema;
     use crate::model::table_schema::TableSchema;
     use crate::storage::{
-        ensure_non_empty_batch_responses, is_retryable_append_status, normalize_append_response,
-        should_retry_batch_responses, BatchAppendRequest, BatchAppendResult, ColumnMode, ColumnType, FieldDescriptor,
-        StorageApi, StreamName, TableBatch, TableDescriptor,
+        classify_batch_responses, ensure_non_empty_batch_responses, is_retryable_append_status,
+        normalize_append_response, should_reset_worker_connection_for_terminal_status, BatchAppendRequest,
+        BatchAppendResult, BatchResponseDecision, ColumnMode, ColumnType, FieldDescriptor, StorageApi, StreamName,
+        TableBatch, TableDescriptor,
     };
     use crate::{env_vars, Client};
 
@@ -1879,12 +1955,81 @@ pub mod test {
         assert!(is_retryable_append_status(&Status::failed_precondition(
             "Closing the stream because it has been inactive"
         )));
+        assert!(is_retryable_append_status(&Status::failed_precondition(
+            "Closing the stream because server is restarted. This is expected and client is advised to reconnect."
+        )));
+        assert!(is_retryable_append_status(&Status::failed_precondition(
+            "closing the stream because the server is restarted"
+        )));
 
         assert!(!is_retryable_append_status(&Status::unknown("some unknown cause")));
         assert!(!is_retryable_append_status(&Status::invalid_argument("invalid")));
         assert!(!is_retryable_append_status(&Status::failed_precondition(
             "failed precondition"
         )));
+    }
+
+    #[test]
+    fn test_should_reset_worker_connection_for_terminal_statuses() {
+        assert!(should_reset_worker_connection_for_terminal_status(&Status::aborted(
+            "Closing the stream because server is restarted. This is expected and client is advised to reconnect."
+        )));
+        assert!(should_reset_worker_connection_for_terminal_status(
+            &Status::failed_precondition("closing the stream because the server is restarted")
+        ));
+        assert!(should_reset_worker_connection_for_terminal_status(
+            &Status::failed_precondition("Closing the stream because it has been inactive")
+        ));
+        assert!(should_reset_worker_connection_for_terminal_status(&Status::unknown(
+            "connection reset by peer"
+        )));
+        assert!(should_reset_worker_connection_for_terminal_status(
+            &Status::deadline_exceeded("deadline")
+        ));
+
+        assert!(!should_reset_worker_connection_for_terminal_status(
+            &Status::resource_exhausted("quota")
+        ));
+        assert!(!should_reset_worker_connection_for_terminal_status(
+            &Status::invalid_argument("invalid")
+        ));
+    }
+
+    #[test]
+    fn test_classify_batch_responses_separates_retry_and_reset_decisions() {
+        assert_eq!(
+            classify_batch_responses(&[Err(Status::aborted(
+                "Closing the stream because server is restarted. This is expected and client is advised to reconnect."
+            ))]),
+            BatchResponseDecision {
+                should_retry: true,
+                should_reset_connection: true,
+            }
+        );
+        assert_eq!(
+            classify_batch_responses(&[Err(Status::resource_exhausted("quota"))]),
+            BatchResponseDecision {
+                should_retry: true,
+                should_reset_connection: false,
+            }
+        );
+        assert_eq!(
+            classify_batch_responses(&[Ok(AppendRowsResponse::default())]),
+            BatchResponseDecision {
+                should_retry: false,
+                should_reset_connection: false,
+            }
+        );
+        assert_eq!(
+            classify_batch_responses(&[
+                Ok(AppendRowsResponse::default()),
+                Err(Status::unknown("connection reset by peer")),
+            ]),
+            BatchResponseDecision {
+                should_retry: true,
+                should_reset_connection: true,
+            }
+        );
     }
 
     #[test]
@@ -1925,13 +2070,25 @@ pub mod test {
     }
 
     #[test]
-    fn test_should_retry_batch_responses_only_for_retryable_request_errors() {
-        assert!(should_retry_batch_responses(&[Err(Status::unavailable("retry"))]));
+    fn test_classify_batch_responses_only_retries_retryable_request_errors() {
+        assert_eq!(
+            classify_batch_responses(&[Err(Status::unavailable("retry"))]),
+            BatchResponseDecision {
+                should_retry: true,
+                should_reset_connection: true,
+            }
+        );
 
-        assert!(!should_retry_batch_responses(&[
-            Err(Status::unavailable("retry")),
-            Err(Status::invalid_argument("do not retry")),
-        ]));
+        assert_eq!(
+            classify_batch_responses(&[
+                Err(Status::unavailable("retry")),
+                Err(Status::invalid_argument("do not retry")),
+            ]),
+            BatchResponseDecision {
+                should_retry: false,
+                should_reset_connection: true,
+            }
+        );
 
         let success_response = AppendRowsResponse {
             updated_schema: None,
@@ -1941,10 +2098,13 @@ pub mod test {
                 append_rows_response::AppendResult { offset: None },
             )),
         };
-        assert!(!should_retry_batch_responses(&[
-            Ok(success_response),
-            Err(Status::unavailable("retry")),
-        ]));
+        assert_eq!(
+            classify_batch_responses(&[Ok(success_response), Err(Status::unavailable("retry"))]),
+            BatchResponseDecision {
+                should_retry: true,
+                should_reset_connection: true,
+            }
+        );
 
         let row_error_response = AppendRowsResponse {
             updated_schema: None,
@@ -1954,7 +2114,13 @@ pub mod test {
                 append_rows_response::AppendResult { offset: None },
             )),
         };
-        assert!(!should_retry_batch_responses(&[Ok(row_error_response)]));
+        assert_eq!(
+            classify_batch_responses(&[Ok(row_error_response)]),
+            BatchResponseDecision {
+                should_retry: false,
+                should_reset_connection: false,
+            }
+        );
     }
 
     #[test]
