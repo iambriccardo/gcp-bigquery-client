@@ -148,7 +148,8 @@ fn should_reset_worker_connection_for_terminal_status(status: &Status) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A decision for a batch response which signals what to do with the response.
+#[derive(Debug, Eq, PartialEq)]
 struct BatchResponseDecision {
     should_retry: bool,
     should_reset_connection: bool,
@@ -1050,7 +1051,9 @@ where
         //
         // For now, we retry the entire table batch under the assumption that re-delivery of a batch
         // is not a big deal for most use cases, but if it starts becoming a problem, a more granular
-        // retry strategy could be implemented.
+        // retry strategy could be implemented. However, this only applies when a batch is split into
+        // more requests due to size limits, otherwise, it's not a problem since the whole batch is
+        // a single request.
         if decision.should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
             let backoff = calculate_append_retry_backoff(attempt);
 
