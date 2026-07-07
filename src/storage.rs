@@ -56,11 +56,13 @@ static BIGQUERY_STORAGE_API_DOMAIN: &str = "bigquerystorage.googleapis.com";
 /// Set to 9MB to provide safety margin under the 10MB BigQuery API limit,
 /// accounting for request metadata overhead.
 pub const MAX_BATCH_SIZE_BYTES: usize = 9 * 1024 * 1024;
-/// Maximum message size for tonic gRPC client configuration.
+/// Maximum message size for tonic gRPC client configuration, matching the
+/// BigQuery Storage Write API's hard 10MB `AppendRowsRequest` limit.
 ///
-/// Set to 20MB to accommodate large response messages and provide headroom
-/// for metadata while staying within reasonable memory bounds.
-const MAX_MESSAGE_SIZE_BYTES: usize = 20 * 1024 * 1024;
+/// Anything above this is rejected by BigQuery regardless of what the local
+/// client allows, so a larger value here would only make this check a less
+/// precise stand-in for the real limit, not provide any additional headroom.
+const MAX_MESSAGE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 /// The name of the default stream in BigQuery.
 ///
 /// This stream is a special built-in stream that always exists for a table.
@@ -284,9 +286,7 @@ pub struct StorageApiConfig {
     ///
     /// Gzip is the only compression algorithm the Storage Write API accepts,
     /// and it is a genuine CPU cost proportional to payload bytes with no way
-    /// to lower its compression level through this API. The Google-maintained
-    /// Java client leaves this disabled by default and only enables it when a
-    /// caller opts in, so this mirrors that default. Enable it only when
+    /// to lower its compression level through this API. Enable it only when
     /// reducing network bytes is worth more than the CPU it costs, such as on
     /// bandwidth-constrained links.
     /// Default: `false`.
@@ -785,10 +785,8 @@ impl ConnectionWorkerAppendHandle {
 
 /// Creates a configured gRPC client for BigQuery Storage Write API.
 ///
-/// `compression` mirrors the Google-maintained Java client's default: gzip is
-/// the only compression algorithm the Storage Write API accepts, and the
-/// reference client leaves it disabled unless a caller opts in
-/// (`StreamWriter.Builder.setCompressorName`, unset by default). Gzip is a
+/// `compression` controls whether the gRPC stream is gzip-compressed, the
+/// only compression algorithm the Storage Write API accepts. Gzip is a
 /// genuine CPU cost proportional to payload bytes, paid on every append with
 /// no way to lower its compression level through this API, so callers should
 /// only enable it when reducing network bytes outweighs that cost, such as
@@ -814,6 +812,7 @@ async fn create_grpc_client(compression: bool) -> Result<BigQueryWriteClient<Cha
     let mut client = BigQueryWriteClient::new(channel)
         .max_encoding_message_size(MAX_MESSAGE_SIZE_BYTES)
         .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES);
+
     if compression {
         client = client
             .send_compressed(CompressionEncoding::Gzip)
