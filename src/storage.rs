@@ -279,6 +279,18 @@ pub struct StorageApiConfig {
     /// call. Google recommends up to 100 concurrent streams per connection.
     /// Default: 400 (connection_pool_size × 100 requests per connection).
     pub max_inflight_requests: usize,
+    /// Whether to gzip-compress the gRPC stream to and from the Storage Write
+    /// API.
+    ///
+    /// Gzip is the only compression algorithm the Storage Write API accepts,
+    /// and it is a genuine CPU cost proportional to payload bytes with no way
+    /// to lower its compression level through this API. The Google-maintained
+    /// Java client leaves this disabled by default and only enables it when a
+    /// caller opts in, so this mirrors that default. Enable it only when
+    /// reducing network bytes is worth more than the CPU it costs, such as on
+    /// bandwidth-constrained links.
+    /// Default: `false`.
+    pub compression: bool,
 }
 
 impl StorageApiConfig {
@@ -293,6 +305,12 @@ impl StorageApiConfig {
         self.max_inflight_requests = max_inflight_requests;
         self
     }
+
+    /// Creates a new configuration with gRPC compression enabled or disabled.
+    pub fn with_compression(mut self, compression: bool) -> Self {
+        self.compression = compression;
+        self
+    }
 }
 
 impl Default for StorageApiConfig {
@@ -300,6 +318,7 @@ impl Default for StorageApiConfig {
         Self {
             connection_pool_size: DEFAULT_CONNECTION_POOL_SIZE,
             max_inflight_requests: DEFAULT_CONNECTION_POOL_SIZE * DEFAULT_REQUESTS_PER_CONNECTION,
+            compression: false,
         }
     }
 }
@@ -765,7 +784,16 @@ impl ConnectionWorkerAppendHandle {
 }
 
 /// Creates a configured gRPC client for BigQuery Storage Write API.
-async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
+///
+/// `compression` mirrors the Google-maintained Java client's default: gzip is
+/// the only compression algorithm the Storage Write API accepts, and the
+/// reference client leaves it disabled unless a caller opts in
+/// (`StreamWriter.Builder.setCompressorName`, unset by default). Gzip is a
+/// genuine CPU cost proportional to payload bytes, paid on every append with
+/// no way to lower its compression level through this API, so callers should
+/// only enable it when reducing network bytes outweighs that cost, such as
+/// bandwidth-constrained links.
+async fn create_grpc_client(compression: bool) -> Result<BigQueryWriteClient<Channel>, BQError> {
     // Since Tonic 0.12.0, TLS root certificates are no longer included by default.
     // They must now be specified explicitly.
     // See: https://github.com/hyperium/tonic/pull/1731
@@ -783,17 +811,23 @@ async fn create_grpc_client() -> Result<BigQueryWriteClient<Channel>, BQError> {
         .connect()
         .await?;
 
-    Ok(BigQueryWriteClient::new(channel)
+    let mut client = BigQueryWriteClient::new(channel)
         .max_encoding_message_size(MAX_MESSAGE_SIZE_BYTES)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES)
-        .send_compressed(CompressionEncoding::Gzip)
-        .accept_compressed(CompressionEncoding::Gzip))
+        .max_decoding_message_size(MAX_MESSAGE_SIZE_BYTES);
+    if compression {
+        client = client
+            .send_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Gzip);
+    }
+
+    Ok(client)
 }
 
 /// Mutable state owned by a single connection worker task.
 struct ConnectionWorkerState {
     worker_id: usize,
     auth: Arc<dyn Authenticator>,
+    compression: bool,
     grpc_client: Mutex<Option<BigQueryWriteClient<Channel>>>,
 }
 
@@ -807,10 +841,11 @@ impl std::fmt::Debug for ConnectionWorkerState {
 
 impl ConnectionWorkerState {
     /// Creates a new worker state with no active gRPC connection.
-    fn new(worker_id: usize, auth: Arc<dyn Authenticator>) -> Self {
+    fn new(worker_id: usize, auth: Arc<dyn Authenticator>, compression: bool) -> Self {
         Self {
             worker_id,
             auth,
+            compression,
             grpc_client: Mutex::new(None),
         }
     }
@@ -824,7 +859,7 @@ impl ConnectionWorkerState {
     async fn invalidate(&self) -> Result<(), Status> {
         self.reset_connection().await;
 
-        match create_grpc_client().await {
+        match create_grpc_client(self.compression).await {
             Ok(client) => {
                 *self.grpc_client.lock().await = Some(client);
 
@@ -896,7 +931,7 @@ enum ConnectionWorkerMessage {
 async fn ensure_worker_client(state: &ConnectionWorkerState) -> Result<BigQueryWriteClient<Channel>, Status> {
     let mut grpc_client = state.grpc_client.lock().await;
     if grpc_client.is_none() {
-        match create_grpc_client().await {
+        match create_grpc_client(state.compression).await {
             Ok(client) => {
                 *grpc_client = Some(client);
             }
@@ -1091,9 +1126,10 @@ where
 async fn run_connection_worker(
     worker_id: usize,
     auth: Arc<dyn Authenticator>,
+    compression: bool,
     mut rx: mpsc::Receiver<ConnectionWorkerMessage>,
 ) {
-    let state = Arc::new(ConnectionWorkerState::new(worker_id, auth));
+    let state = Arc::new(ConnectionWorkerState::new(worker_id, auth, compression));
     let mut worker_tasks = JoinSet::new();
     let mut should_close = false;
 
@@ -1228,7 +1264,12 @@ struct ConnectionWorkerSet {
 
 impl ConnectionWorkerSet {
     /// Spawns a fixed number of connection workers.
-    fn new(worker_count: usize, auth: Arc<dyn Authenticator>, max_inflight_requests: usize) -> Self {
+    fn new(
+        worker_count: usize,
+        auth: Arc<dyn Authenticator>,
+        max_inflight_requests: usize,
+        compression: bool,
+    ) -> Self {
         let worker_count = worker_count.max(1);
 
         let mut senders = Vec::with_capacity(worker_count);
@@ -1238,7 +1279,7 @@ impl ConnectionWorkerSet {
             senders.push(tx);
             inflight_requests.push(AtomicUsize::new(0));
 
-            tokio::spawn(run_connection_worker(worker_id, auth.clone(), rx));
+            tokio::spawn(run_connection_worker(worker_id, auth.clone(), compression, rx));
         }
 
         Self {
@@ -1361,6 +1402,9 @@ pub struct StorageApi {
     auth: Arc<dyn Authenticator>,
     /// Base URL for BigQuery API endpoints.
     base_url: String,
+    /// Whether gRPC compression is enabled, for connections created outside
+    /// the pooled connection workers.
+    compression: bool,
 }
 
 impl std::fmt::Debug for StorageApi {
@@ -1376,12 +1420,18 @@ impl StorageApi {
     /// Creates a new storage API client instance with a custom configuration.
     pub(crate) async fn with_config(auth: Arc<dyn Authenticator>, config: StorageApiConfig) -> Result<Self, BQError> {
         let worker_count = config.connection_pool_size.max(1);
-        let connection_workers = ConnectionWorkerSet::new(worker_count, auth.clone(), config.max_inflight_requests);
+        let connection_workers = ConnectionWorkerSet::new(
+            worker_count,
+            auth.clone(),
+            config.max_inflight_requests,
+            config.compression,
+        );
 
         Ok(Self {
             connection_workers,
             auth,
             base_url: BIG_QUERY_V2_URL.to_string(),
+            compression: config.compression,
         })
     }
 
@@ -1461,7 +1511,7 @@ impl StorageApi {
         };
 
         let request = Self::new_authorized_request(self.auth.clone(), get_write_stream_request).await?;
-        let mut grpc_client = create_grpc_client().await?;
+        let mut grpc_client = create_grpc_client(self.compression).await?;
 
         grpc_client
             .get_write_stream(request)
@@ -1496,7 +1546,7 @@ impl StorageApi {
 
         let request =
             Self::new_authorized_request(self.auth.clone(), tokio_stream::iter(vec![append_rows_request])).await?;
-        let mut grpc_client = create_grpc_client().await?;
+        let mut grpc_client = create_grpc_client(self.compression).await?;
 
         grpc_client
             .append_rows(request)
