@@ -505,8 +505,8 @@ impl<M> Clone for BatchAppendRequest<M> {
 /// Result of processing a single table batch in concurrent append operations.
 ///
 /// Contains the batch processing results along with metadata about the operation,
-/// including the original batch index for result ordering and total bytes sent
-/// for monitoring and debugging purposes.
+/// including the original batch index for result ordering and byte counts for
+/// monitoring and billing.
 #[derive(Debug)]
 pub struct BatchAppendResult {
     /// Original index of the batch in the input vector.
@@ -520,8 +520,12 @@ pub struct BatchAppendResult {
     /// resulting in multiple responses. All responses must be checked for
     /// errors to ensure complete batch success.
     pub responses: Vec<Result<AppendRowsResponse, Status>>,
-    /// Total bytes sent for this batch across all requests.
-    pub bytes_sent: usize,
+    /// Bytes sent across all requests and retry attempts.
+    pub total_bytes_sent: usize,
+    /// Bytes sent by the final successful attempt.
+    ///
+    /// This is zero when the batch did not complete successfully.
+    pub successful_bytes_sent: usize,
 }
 
 impl BatchAppendResult {
@@ -529,11 +533,17 @@ impl BatchAppendResult {
     ///
     /// Combines all result metadata into a single cohesive structure
     /// for easier handling by calling code.
-    pub fn new(batch_index: usize, responses: Vec<Result<AppendRowsResponse, Status>>, bytes_sent: usize) -> Self {
+    pub fn new(
+        batch_index: usize,
+        responses: Vec<Result<AppendRowsResponse, Status>>,
+        total_bytes_sent: usize,
+        successful_bytes_sent: usize,
+    ) -> Self {
         Self {
             batch_index,
             responses,
-            bytes_sent,
+            total_bytes_sent,
+            successful_bytes_sent,
         }
     }
 
@@ -544,18 +554,44 @@ impl BatchAppendResult {
     /// - response has no row-level errors,
     /// - response outcome is `append_result` (not missing and not `error`).
     pub fn is_success(&self) -> bool {
-        self.responses.iter().all(|result| {
-            let response = match result {
-                Ok(response) => response,
-                Err(_) => return false,
-            };
+        responses_are_successful(&self.responses)
+    }
+}
 
-            response.row_errors.is_empty()
-                && matches!(
-                    response.response.as_ref(),
-                    Some(append_rows_response::Response::AppendResult(_))
-                )
-        })
+/// Returns whether every append response completed successfully.
+fn responses_are_successful(responses: &[Result<AppendRowsResponse, Status>]) -> bool {
+    responses.iter().all(|result| {
+        let response = match result {
+            Ok(response) => response,
+            Err(_) => return false,
+        };
+
+        response.row_errors.is_empty()
+            && matches!(
+                response.response.as_ref(),
+                Some(append_rows_response::Response::AppendResult(_))
+            )
+    })
+}
+
+/// Tracks attempted and successful request bytes across append retries.
+#[derive(Default)]
+struct BatchAppendByteCounts {
+    /// Bytes sent across every attempt.
+    total: usize,
+    /// Bytes sent by the successful attempt, or zero if none succeeded.
+    successful: usize,
+}
+
+impl BatchAppendByteCounts {
+    /// Records the bytes and outcome of one append attempt.
+    fn record_attempt(&mut self, responses: &[Result<AppendRowsResponse, Status>], bytes_sent: usize) {
+        self.total += bytes_sent;
+        self.successful = if responses_are_successful(responses) {
+            bytes_sent
+        } else {
+            0
+        };
     }
 }
 
@@ -1051,12 +1087,13 @@ where
 {
     let stream_name = table_batch.stream_name().to_string();
     let proto_schema = StorageApi::create_proto_schema(table_batch.table_descriptor());
-    let bytes_sent_counter = Arc::new(AtomicUsize::new(0));
+    let mut byte_counts = BatchAppendByteCounts::default();
 
     let mut batch_responses = Vec::new();
 
     for attempt in 0..MAX_APPEND_RETRY_ATTEMPTS {
         batch_responses.clear();
+        let attempt_bytes_sent_counter = Arc::new(AtomicUsize::new(0));
 
         batch_responses = worker_handle_table_batch_once(
             state.clone(),
@@ -1064,10 +1101,13 @@ where
             batch_index,
             &stream_name,
             proto_schema.clone(),
-            bytes_sent_counter.clone(),
+            attempt_bytes_sent_counter.clone(),
             trace_id.clone(),
         )
         .await;
+
+        let attempt_bytes_sent = attempt_bytes_sent_counter.load(Ordering::Relaxed);
+        byte_counts.record_attempt(&batch_responses, attempt_bytes_sent);
 
         // We make a decision on the batch responses on how to handle the results.
         let decision = classify_batch_responses(&batch_responses);
@@ -1115,16 +1155,16 @@ where
         break;
     }
 
-    let bytes_sent = bytes_sent_counter.load(Ordering::Relaxed);
     debug!(
         worker_id = state.worker_id,
         batch_index,
         stream_name = %stream_name,
-        bytes_sent,
+        total_bytes_sent = byte_counts.total,
+        successful_bytes_sent = byte_counts.successful,
         "batch completed in connection worker"
     );
 
-    BatchAppendResult::new(batch_index, batch_responses, bytes_sent)
+    BatchAppendResult::new(batch_index, batch_responses, byte_counts.total, byte_counts.successful)
 }
 
 /// Background task loop for a single connection worker.
@@ -1269,12 +1309,7 @@ struct ConnectionWorkerSet {
 
 impl ConnectionWorkerSet {
     /// Spawns a fixed number of connection workers.
-    fn new(
-        worker_count: usize,
-        auth: Arc<dyn Authenticator>,
-        max_inflight_requests: usize,
-        compression: bool,
-    ) -> Self {
+    fn new(worker_count: usize, auth: Arc<dyn Authenticator>, max_inflight_requests: usize, compression: bool) -> Self {
         let worker_count = worker_count.max(1);
 
         let mut senders = Vec::with_capacity(worker_count);
@@ -1726,9 +1761,9 @@ pub mod test {
     use crate::model::table_schema::TableSchema;
     use crate::storage::{
         classify_batch_responses, ensure_non_empty_batch_responses, is_retryable_append_status,
-        normalize_append_response, should_reset_worker_connection_for_terminal_status, BatchAppendRequest,
-        BatchAppendResult, BatchResponseDecision, ColumnMode, ColumnType, FieldDescriptor, StorageApi, StreamName,
-        TableBatch, TableDescriptor,
+        normalize_append_response, should_reset_worker_connection_for_terminal_status, BatchAppendByteCounts,
+        BatchAppendRequest, BatchAppendResult, BatchResponseDecision, ColumnMode, ColumnType, FieldDescriptor,
+        StorageApi, StreamName, TableBatch, TableDescriptor,
     };
     use crate::{env_vars, Client};
 
@@ -1949,13 +1984,19 @@ pub mod test {
             }
 
             // Verify that some bytes were sent (should be greater than 0).
-            let bytes_sent = batch_result.bytes_sent;
+            let bytes_sent = batch_result.total_bytes_sent;
             assert!(
                 bytes_sent > 0,
                 "Bytes sent should be greater than 0 for batch {}, got: {}",
                 batch_result.batch_index,
                 bytes_sent
             );
+            assert!(
+                batch_result.successful_bytes_sent > 0,
+                "Successful bytes sent should be greater than 0 for batch {}",
+                batch_result.batch_index
+            );
+            assert!(batch_result.successful_bytes_sent <= bytes_sent);
 
             total_bytes_across_all_batches += bytes_sent;
         }
@@ -2210,8 +2251,10 @@ pub mod test {
                 append_rows_response::AppendResult { offset: None },
             )),
         };
-        let batch_result = BatchAppendResult::new(0, vec![Ok(success_response)], 10);
+        let batch_result = BatchAppendResult::new(0, vec![Ok(success_response)], 10, 10);
         assert!(batch_result.is_success());
+        assert_eq!(batch_result.total_bytes_sent, 10);
+        assert_eq!(batch_result.successful_bytes_sent, 10);
 
         let missing_response = AppendRowsResponse {
             updated_schema: None,
@@ -2219,8 +2262,9 @@ pub mod test {
             write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
             response: None,
         };
-        let batch_result = BatchAppendResult::new(0, vec![Ok(missing_response)], 10);
+        let batch_result = BatchAppendResult::new(0, vec![Ok(missing_response)], 10, 0);
         assert!(!batch_result.is_success());
+        assert_eq!(batch_result.successful_bytes_sent, 0);
 
         let row_error_response = AppendRowsResponse {
             updated_schema: None,
@@ -2230,7 +2274,40 @@ pub mod test {
                 append_rows_response::AppendResult { offset: None },
             )),
         };
-        let batch_result = BatchAppendResult::new(0, vec![Ok(row_error_response)], 10);
+        let batch_result = BatchAppendResult::new(0, vec![Ok(row_error_response)], 10, 0);
         assert!(!batch_result.is_success());
+        assert_eq!(batch_result.successful_bytes_sent, 0);
+    }
+
+    #[test]
+    fn test_batch_append_byte_counts_excludes_failed_retry_attempts() {
+        let successful_response = AppendRowsResponse {
+            updated_schema: None,
+            row_errors: Vec::new(),
+            write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
+            response: Some(append_rows_response::Response::AppendResult(
+                append_rows_response::AppendResult { offset: None },
+            )),
+        };
+        let failed_response = Err(Status::unavailable("retry"));
+        let mut byte_counts = BatchAppendByteCounts::default();
+
+        byte_counts.record_attempt(&[failed_response], 100);
+        assert_eq!(byte_counts.total, 100);
+        assert_eq!(byte_counts.successful, 0);
+
+        byte_counts.record_attempt(
+            &[
+                Ok(successful_response.clone()),
+                Err(Status::unavailable("retry remaining requests")),
+            ],
+            80,
+        );
+        assert_eq!(byte_counts.total, 180);
+        assert_eq!(byte_counts.successful, 0);
+
+        byte_counts.record_attempt(&[Ok(successful_response)], 60);
+        assert_eq!(byte_counts.total, 240);
+        assert_eq!(byte_counts.successful, 60);
     }
 }
