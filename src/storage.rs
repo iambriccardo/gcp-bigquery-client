@@ -51,6 +51,8 @@ use crate::{
 static BIG_QUERY_STORAGE_API_URL: &str = "https://bigquerystorage.googleapis.com";
 /// Domain name for BigQuery Storage API used in TLS configuration.
 static BIGQUERY_STORAGE_API_DOMAIN: &str = "bigquerystorage.googleapis.com";
+/// Routing metadata header used by Google APIs.
+const X_GOOG_REQUEST_PARAMS_HEADER: &str = "x-goog-request-params";
 /// Maximum size limit for batched append requests in bytes.
 ///
 /// Set to 9MB to provide safety margin under the 10MB BigQuery API limit,
@@ -1006,7 +1008,7 @@ where
     let mut batch_responses = Vec::new();
 
     let request_stream = AppendRequestsStream::new(table_batch, proto_schema, bytes_sent_counter, trace_id);
-    let request = match StorageApi::new_authorized_request(state.auth.clone(), request_stream).await {
+    let mut request = match StorageApi::new_authorized_request(state.auth.clone(), request_stream).await {
         Ok(request) => request,
         Err(err) => {
             warn!(
@@ -1022,6 +1024,20 @@ where
             return batch_responses;
         }
     };
+
+    if let Err(err) = StorageApi::add_append_rows_routing_metadata(&mut request, stream_name) {
+        warn!(
+            worker_id = state.worker_id,
+            batch_index,
+            stream_name = %stream_name,
+            error = %err,
+            "failed to add append rows routing metadata"
+        );
+
+        batch_responses.push(Err(Status::invalid_argument(err.to_string())));
+
+        return batch_responses;
+    }
 
     // Clone the client before starting the RPC so this worker can multiplex more appends.
     let mut client = match ensure_worker_client(state.as_ref()).await {
@@ -1584,8 +1600,9 @@ impl StorageApi {
             rows: Some(rows),
         };
 
-        let request =
+        let mut request =
             Self::new_authorized_request(self.auth.clone(), tokio_stream::iter(vec![append_rows_request])).await?;
+        Self::add_append_rows_routing_metadata(&mut request, &stream_name_str)?;
         let mut grpc_client = create_grpc_client(self.compression).await?;
 
         grpc_client
@@ -1680,6 +1697,16 @@ impl StorageApi {
         Ok(request)
     }
 
+    /// Adds the write stream routing metadata required by [`Self::append_rows`].
+    fn add_append_rows_routing_metadata<T>(request: &mut Request<T>, stream_name: &str) -> Result<(), BQError> {
+        let routing_value = format!("write_stream={stream_name}").try_into()?;
+        request
+            .metadata_mut()
+            .insert(X_GOOG_REQUEST_PARAMS_HEADER, routing_value);
+
+        Ok(())
+    }
+
     /// Converts table field descriptors to protobuf field descriptors.
     ///
     /// Transforms the high-level field descriptors into the protobuf
@@ -1750,7 +1777,7 @@ pub mod test {
     use prost::Message;
     use std::time::{Duration, SystemTime};
     use tokio_stream::StreamExt;
-    use tonic::Status;
+    use tonic::{Request, Status};
 
     use crate::google::cloud::bigquery::storage::v1::{append_rows_response, AppendRowsResponse, RowError};
     use crate::google::rpc::Status as GoogleRpcStatus;
@@ -1808,6 +1835,24 @@ pub mod test {
         ];
 
         TableDescriptor { field_descriptors }
+    }
+
+    #[test]
+    fn test_add_append_rows_routing_metadata() {
+        let stream_name = "projects/test-project/datasets/test_dataset/tables/test_table/streams/_default";
+        let mut request = Request::new(());
+
+        StorageApi::add_append_rows_routing_metadata(&mut request, stream_name).unwrap();
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("x-goog-request-params")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("write_stream={stream_name}")
+        );
     }
 
     async fn setup_test_table(
