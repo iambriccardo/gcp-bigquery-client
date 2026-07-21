@@ -840,16 +840,9 @@ async fn create_grpc_client(compression: bool) -> Result<BigQueryWriteClient<Cha
 
     let channel = Channel::from_static(BIG_QUERY_STORAGE_API_URL)
         .tls_config(tls_config)?
-        // Configure HTTP/2 keepalive to detect dead connections and prevent
-        // proxies from closing idle connections.
         .http2_keep_alive_interval(Duration::from_secs(HTTP2_KEEPALIVE_INTERVAL_SECS))
         .keep_alive_timeout(Duration::from_secs(HTTP2_KEEPALIVE_TIMEOUT_SECS))
         .keep_alive_while_idle(true)
-        // Append requests can carry several megabytes of row data, but the
-        // default HTTP/2 flow-control window is a fixed 64KB. Without this,
-        // sending one large request needs dozens of window-update round
-        // trips before the peer allows more bytes in flight, adding a full
-        // network round trip per window's worth of data on every append.
         .http2_adaptive_window(true)
         .connect()
         .await?;
