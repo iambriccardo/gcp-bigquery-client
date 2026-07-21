@@ -55,16 +55,15 @@ static BIGQUERY_STORAGE_API_DOMAIN: &str = "bigquerystorage.googleapis.com";
 const X_GOOG_REQUEST_PARAMS_HEADER: &str = "x-goog-request-params";
 /// Approximate row-data target for batched append requests.
 ///
-/// Set to 19 MiB to leave headroom below BigQuery's 20 MB limit for the
-/// stream name, schema, trace ID, and protobuf field framing. This follows the
-/// Google Java client's inexpensive payload-size approach.
+/// Set to 19 MiB to leave headroom below BigQuery's documented 20 MB request
+/// limit for the stream name, schema, trace ID, and protobuf field framing.
 pub const MAX_BATCH_SIZE_BYTES: usize = 19 * 1024 * 1024;
 /// Maximum encoded message size for the tonic gRPC client.
 ///
-/// BigQuery requires each serialized `AppendRowsRequest` to be smaller than
-/// 20 MB. The lower batching target keeps requests produced by this client
-/// away from this hard limit. The vendored proto and generated Rust docs still
-/// contain Google's stale 10 MB proto comment; it does not enforce a limit.
+/// BigQuery currently documents a 20 MB `AppendRowsRequest` limit. The lower
+/// batching target keeps requests produced by this client away from that
+/// limit. The vendored proto and generated Rust docs still contain Google's
+/// stale 10 MB proto comment; it does not enforce a limit.
 const MAX_MESSAGE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 /// The name of the default stream in BigQuery.
 ///
@@ -72,11 +71,7 @@ const MAX_MESSAGE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 const DEFAULT_STREAM_NAME: &str = "_default";
 /// Default number of connections in the pool.
 ///
-/// With HTTP/2 multiplexing, a small number of connections (2-4) is sufficient
-/// for high throughput since multiple gRPC streams share each connection.
-/// Google recommends reusing connections extensively—a single connection can
-/// support 1-10+ MBps throughput. Multiple connections provide fault isolation
-/// rather than increased parallelism.
+/// Each connection worker owns one reusable HTTP/2 connection.
 const DEFAULT_CONNECTION_POOL_SIZE: usize = 4;
 /// Per-worker channel capacity for handing off jobs to connection workers.
 ///
@@ -84,16 +79,12 @@ const DEFAULT_CONNECTION_POOL_SIZE: usize = 4;
 /// backpressure mechanism. The worker channel is only a bounded handoff queue.
 const CONNECTION_WORKER_CHANNEL_CAPACITY: usize = 4;
 
-/// Default maximum inflight requests per connection.
-///
-/// HTTP/2 connections can handle many concurrent streams efficiently. Google
-/// recommends up to 100 concurrent streams per connection for optimal throughput.
+/// Default maximum in-flight requests per connection.
 const DEFAULT_REQUESTS_PER_CONNECTION: usize = 100;
 /// HTTP/2 keepalive interval in seconds.
 ///
-/// Sends PING frames at this interval to keep connections alive and detect
-/// dead connections. Set to 30 seconds to stay well under typical proxy
-/// idle timeouts (GCP: 10 min, AWS ELB: 60 sec).
+/// Sends PING frames at this interval to keep idle connections active and
+/// detect broken connections.
 const HTTP2_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 /// HTTP/2 keepalive timeout in seconds.
 ///
@@ -127,7 +118,8 @@ fn is_retryable_append_status(status: &Status) -> bool {
 
 /// Returns true for known BigQuery stream close messages that require a reconnect.
 ///
-/// This was taken from the Java BigQuery SDK.
+/// These messages are also handled as connection failures by the Google Java
+/// BigQuery Storage client.
 fn is_retryable_stream_close_message(message: &str) -> bool {
     let message = message.to_lowercase();
 
@@ -265,10 +257,6 @@ fn ensure_non_empty_batch_responses(
 }
 
 /// Configuration for the BigQuery Storage Write API client.
-///
-/// A single HTTP/2 connection can support 1-10+ MBps throughput with up to
-/// 100 concurrent gRPC streams. Multiple workers provide fault isolation and
-/// parallel request handling across independent connections.
 #[derive(Debug, Clone)]
 pub struct StorageApiConfig {
     /// Number of connection workers.
@@ -277,21 +265,17 @@ pub struct StorageApiConfig {
     /// one gRPC connection. The field name is kept for backward compatibility.
     /// Default: 4.
     pub connection_pool_size: usize,
-    /// Maximum number of inflight gRPC requests across all StorageApi operations.
+    /// Maximum number of in-flight batch append jobs.
     ///
-    /// This is a global limit shared across all concurrent calls to the StorageApi.
-    /// Each request acquires a permit from a shared semaphore before making a gRPC
-    /// call. Google recommends up to 100 concurrent streams per connection.
-    /// Default: 400 (connection_pool_size × 100 requests per connection).
+    /// The limit is shared by all connection workers. Each batch holds one
+    /// permit until it completes, including retries. Default: 400
+    /// (`connection_pool_size × 100`).
     pub max_inflight_requests: usize,
     /// Whether to gzip-compress the gRPC stream to and from the Storage Write
     /// API.
     ///
-    /// Gzip is the only compression algorithm the Storage Write API accepts,
-    /// and it is a genuine CPU cost proportional to payload bytes with no way
-    /// to lower its compression level through this API. Enable it only when
-    /// reducing network bytes is worth more than the CPU it costs, such as on
-    /// bandwidth-constrained links.
+    /// Gzip is the compression algorithm supported by this client. Compression
+    /// can reduce network traffic at the cost of additional CPU work.
     /// Default: `false`.
     pub compression: bool,
 }
@@ -303,7 +287,8 @@ impl StorageApiConfig {
         self
     }
 
-    /// Creates a new configuration with the specified max inflight requests.
+    /// Creates a new configuration with the specified maximum number of
+    /// in-flight batch append jobs.
     pub fn with_max_inflight_requests(mut self, max_inflight_requests: usize) -> Self {
         self.max_inflight_requests = max_inflight_requests;
         self
@@ -407,7 +392,7 @@ impl From<ColumnMode> for Label {
 /// generated schema.
 #[derive(Debug, Clone)]
 pub struct FieldDescriptor {
-    /// Unique field number starting from 1, incrementing for each field.
+    /// Protobuf field number. It must be nonzero and unique within the table.
     pub number: u32,
     /// Name of the field as it appears in BigQuery.
     pub name: String,
@@ -420,8 +405,7 @@ pub struct FieldDescriptor {
 /// Complete schema definition for a BigQuery table.
 ///
 /// Aggregates all field descriptors that define the table's structure.
-/// Used to generate protobuf schemas for BigQuery Storage Write API operations
-/// and validate row data before transmission.
+/// Used to generate protobuf schemas for BigQuery Storage Write API operations.
 #[derive(Debug, Clone)]
 pub struct TableDescriptor {
     /// Collection of field descriptors defining the table schema.
@@ -439,9 +423,8 @@ struct TableBatchInner<M> {
 /// Collection of rows targeting a specific BigQuery table for batch processing.
 ///
 /// Encapsulates rows with their destination stream and schema metadata,
-/// enabling efficient batch operations and optimal parallelism distribution
-/// across multiple tables in concurrent append operations. Cloning is cheap
-/// as the data is stored behind an [`Arc`].
+/// enabling concurrent append operations across multiple tables. Cloning is
+/// cheap because the data is stored behind an [`Arc`].
 #[derive(Debug)]
 pub struct TableBatch<M>(Arc<TableBatchInner<M>>);
 
@@ -509,7 +492,7 @@ impl<M> Clone for BatchAppendRequest<M> {
 ///
 /// Contains the batch processing results along with metadata about the operation,
 /// including the original batch index for result ordering and byte counts for
-/// monitoring and billing.
+/// monitoring.
 #[derive(Debug)]
 pub struct BatchAppendResult {
     /// Original index of the batch in the input vector.
@@ -520,8 +503,8 @@ pub struct BatchAppendResult {
     /// Collection of append operation responses for this batch.
     ///
     /// Each batch may generate multiple append requests due to size limits,
-    /// resulting in multiple responses. All responses must be checked for
-    /// errors to ensure complete batch success.
+    /// resulting in multiple responses. Use [`Self::is_success`] to determine
+    /// whether the complete batch succeeded.
     pub responses: Vec<Result<AppendRowsResponse, Status>>,
     /// Bytes sent across all requests and retry attempts.
     pub total_bytes_sent: usize,
@@ -631,8 +614,7 @@ impl StreamName {
 
     /// Creates a stream name using the default stream identifier.
     ///
-    /// Uses "_default" as the stream component, which is the standard
-    /// stream identifier for most BigQuery write operations.
+    /// Uses BigQuery's special `_default` stream identifier.
     pub fn new_default(project: String, dataset: String, table: String) -> StreamName {
         StreamName {
             project,
@@ -669,10 +651,10 @@ impl Display for StreamName {
 
 /// Streaming adapter that converts message batches into [`AppendRowsRequest`] objects.
 ///
-/// Automatically chunks large batches into multiple requests while respecting
-/// the 20 MB BigQuery API size limit. If a single row exceeds the configured
-/// limit, it is sent alone and may be rejected by the server. Implements [`Stream`] for seamless
-/// integration with async streaming workflows and gRPC client operations.
+/// Automatically chunks large batches using the approximate 19 MiB encoded-row
+/// target. A single row larger than the target is sent by itself and may be
+/// rejected by BigQuery. Implements [`Stream`] for use with the streaming gRPC
+/// client.
 #[pin_project]
 #[derive(Debug)]
 pub struct AppendRequestsStream<M> {
@@ -683,10 +665,10 @@ pub struct AppendRequestsStream<M> {
     proto_schema: ProtoSchema,
     /// Current position in the batch being processed.
     current_index: usize,
-    /// Whether to include writer schema in the next request (first only).
+    /// Whether to include the writer schema in the next request.
     ///
-    /// This boolean is used under the assumption that a batch of append requests belongs to the same
-    /// table and has no schema differences between the rows.
+    /// A batch targets one table and uses one schema, so the schema is included
+    /// only in its first request.
     include_schema_next: bool,
     /// Shared atomic counter for tracking total bytes sent across all requests in this stream.
     bytes_sent_counter: Arc<AtomicUsize>,
@@ -725,10 +707,9 @@ where
 
     /// Produces the next append request from the message batch.
     ///
-    /// Processes messages sequentially, accumulating them into requests
-    /// until the size limit is reached. Returns [`Poll::Ready(None)`]
-    /// when all messages have been consumed. Each request contains the
-    /// maximum number of messages that fit within size constraints.
+    /// Processes messages sequentially, accumulating them until the approximate
+    /// encoded-row target is reached. Returns [`Poll::Ready(None)`] after all
+    /// messages have been consumed.
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         let rows = this.table_batch.rows();
@@ -741,11 +722,10 @@ where
         let mut total_size = 0;
         let mut processed_count = 0;
 
-        // Process messages from `current_index` onwards. We do not change the vector while processing
-        // to avoid reallocations which are unnecessary.
+        // Read rows in place to avoid cloning or modifying the source vector.
         for msg in rows.iter().skip(*this.current_index) {
-            // First, check the encoded length to avoid performing a full encode
-            // on the first message that would exceed the limit and be dropped.
+            // Check the encoded length before encoding a row that belongs in
+            // the next request chunk.
             let size = msg.encoded_len();
             if total_size + size > MAX_BATCH_SIZE_BYTES && !serialized_rows.is_empty() {
                 break;
@@ -787,12 +767,12 @@ where
             rows: Some(append_rows_request::Rows::ProtoRows(proto_data)),
         };
 
-        // Track the total bytes being sent using encoded_len
+        // Track the complete encoded request size.
         let request_bytes = append_rows_request.encoded_len();
         this.bytes_sent_counter.fetch_add(request_bytes, Ordering::Relaxed);
 
         *this.current_index += processed_count;
-        // After the first request, avoid sending schema again in this stream
+        // Send the schema only in the first request for this batch.
         if *this.include_schema_next {
             *this.include_schema_next = false;
         }
@@ -824,12 +804,8 @@ impl ConnectionWorkerAppendHandle {
 
 /// Creates a configured gRPC client for BigQuery Storage Write API.
 ///
-/// `compression` controls whether the gRPC stream is gzip-compressed, the
-/// only compression algorithm the Storage Write API accepts. Gzip is a
-/// genuine CPU cost proportional to payload bytes, paid on every append with
-/// no way to lower its compression level through this API, so callers should
-/// only enable it when reducing network bytes outweighs that cost, such as
-/// bandwidth-constrained links.
+/// `compression` controls whether requests are gzip-compressed and whether
+/// gzip-compressed responses are accepted.
 async fn create_grpc_client(compression: bool) -> Result<BigQueryWriteClient<Channel>, BQError> {
     // Since Tonic 0.12.0, TLS root certificates are no longer included by default.
     // They must now be specified explicitly.
@@ -947,11 +923,11 @@ where
         let result =
             worker_handle_table_batch_with_retry(state, self.table_batch, self.batch_index, self.trace_id).await;
 
-        // We send back the result once we finish handling the batch.
+        // Return the result to the caller waiting on this job.
         if self.response_tx.send(result).is_err() {
             warn!(worker_id, "failed to send append result from worker");
         }
-        // self drops here: response_tx first, then _permit, then _inflight_guard.
+        // Dropping the job releases its semaphore permit and load counter.
     }
 }
 
@@ -1119,11 +1095,11 @@ where
         let attempt_bytes_sent = attempt_bytes_sent_counter.load(Ordering::Relaxed);
         byte_counts.record_attempt(&batch_responses, attempt_bytes_sent);
 
-        // We make a decision on the batch responses on how to handle the results.
+        // Decide whether the batch should be retried and whether its connection
+        // should be reset first.
         let decision = classify_batch_responses(&batch_responses);
 
-        // When we are instructed to reset the connection, it will be cleared and re-created on
-        // the next connection request.
+        // A reset clears the cached client; the next append recreates it.
         if decision.should_reset_connection {
             warn!(
                 worker_id = state.worker_id,
@@ -1136,14 +1112,9 @@ where
             state.reset_connection().await;
         }
 
-        // When we are instructed to retry the request, it will be retried if the limit was not
-        // reached.
-        //
-        // For now, we retry the entire table batch under the assumption that re-delivery of a batch
-        // is not a big deal for most use cases, but if it starts becoming a problem, a more granular
-        // retry strategy could be implemented. However, this only applies when a batch is split into
-        // more requests due to size limits, otherwise, it's not a problem since the whole batch is
-        // a single request.
+        // Retries replay the entire table batch. If an earlier request in a
+        // multi-request batch was acknowledged before a later request failed,
+        // this can resend already committed rows.
         if decision.should_retry && attempt < MAX_APPEND_RETRY_ATTEMPTS - 1 {
             let backoff = calculate_append_retry_backoff(attempt);
 
@@ -1201,7 +1172,8 @@ async fn run_connection_worker(
             message = rx.recv() => {
                 match message {
                     Some(ConnectionWorkerMessage::AppendRows(request)) => {
-                        // Spawn per-batch tasks because one HTTP/2 connection can multiplex many append streams.
+                        // Run batches independently so one HTTP/2 connection can
+                        // multiplex multiple append streams.
                         let task_state = state.clone();
                         worker_tasks.spawn(async move {
                             request.run(task_state).await;
@@ -1222,8 +1194,7 @@ async fn run_connection_worker(
         }
     }
 
-    // Before shutting down, we abort all tasks and wait for them to finish to avoid having tasks
-    // outlive the worker.
+    // Abort and join active jobs so they cannot outlive the worker.
     worker_tasks.abort_all();
     while let Some(result) = worker_tasks.join_next().await {
         if let Err(err) = result {
@@ -1246,8 +1217,7 @@ struct ConnectionWorkerSetInner {
 impl Drop for ConnectionWorkerSetInner {
     fn drop(&mut self) {
         for sender in &self.senders {
-            // When the connection workers receive this message, they are expected to terminate as
-            // quickly as possible.
+            // Ask each worker to stop when the final worker-set handle is dropped.
             if let Err(err) = sender.try_send(ConnectionWorkerMessage::Close) {
                 warn!(error = %err, "failed to close connection worker on worker set drop");
             }
@@ -1282,22 +1252,16 @@ impl ConnectionWorkerSetInner {
 
     /// Selects a worker using the power-of-two-choices strategy.
     ///
-    /// This is a small improvement over pure round-robin to distribute work better
-    /// when some workers are temporarily slower or stuck. Selection stays O(1),
-    /// and the in-flight counters may be slightly stale, which is acceptable here.
-    ///
-    /// This is not optimal because it does not account for batch size or expected
-    /// retry cost, only the number of currently in-flight jobs. That is sufficient
-    /// for now and keeps dispatch cheap.
+    /// Compares the approximate load of two workers and selects the less busy
+    /// one. Selection is O(1) and does not account for batch size or retry cost.
     fn select_worker_index(&self) -> usize {
         let worker_count = self.senders.len();
         if worker_count <= 1 {
             return 0;
         }
 
-        // This path has a race condition, but it's fine for the sake of the worker selection since
-        // in the worst case it could lead to non-contiguous workers being chosen which is still fine
-        // for the selection strategy that we are using.
+        // Concurrent selections may observe slightly stale counters. Worker
+        // selection is intentionally approximate.
         let first_worker_index = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
         let second_worker_index = self.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
         let first_inflight = self.inflight(first_worker_index);
@@ -1342,7 +1306,7 @@ impl ConnectionWorkerSet {
         }
     }
 
-    /// Dispatches a table batch to one worker selected in round-robin order.
+    /// Dispatches a table batch using the power-of-two-choices strategy.
     async fn append_table_batch<M>(
         &self,
         table_batch: TableBatch<M>,
@@ -1358,8 +1322,7 @@ impl ConnectionWorkerSet {
             )));
         }
 
-        // We first check if we are allowed to enqueue a new append requests operation to make sure
-        // we don't surpass the total inflight requests limit.
+        // Apply global backpressure before enqueueing the batch.
         let permit = self
             .inner
             .max_inflight_requests_semaphore
@@ -1367,8 +1330,7 @@ impl ConnectionWorkerSet {
             .acquire_owned()
             .await?;
 
-        // We obtain the worker index to which the request will be dispatched, and we track the inflight
-        // request in the worker, which will be useful for load balancing.
+        // Track the selected worker's load until the batch completes.
         let worker_index = self.inner.select_worker_index();
         let inflight_guard = self.inner.inflight_guard(worker_index);
 
@@ -1501,9 +1463,7 @@ impl StorageApi {
     /// rows successfully processed. When the returned count is less than
     /// the input slice length, additional calls are required for remaining rows.
     ///
-    /// This limit applies only to the serialized row messages, not to the
-    /// complete `AppendRowsRequest`. Callers should leave room below the 20 MB
-    /// API limit for the schema, stream name, trace ID, and protobuf framing.
+    /// `max_size_bytes` is an approximate limit based on the encoded row data.
     pub fn create_rows<M: Message>(
         table_descriptor: &TableDescriptor,
         rows: &[M],
@@ -1617,14 +1577,14 @@ impl StorageApi {
     /// ordered by completion, not by submission; use `BatchAppendResult::batch_index`
     /// to correlate with the original input order.
     ///
-    /// Each table batch will result in its own AppendRequests gRPC request and if a batch exceeds
-    /// the limit of 10mb, it will be split into multiple requests automatically.
+    /// Each attempt for a table batch starts one `AppendRows` RPC. A batch whose
+    /// estimated encoded row data exceeds 19 MiB is split into multiple request
+    /// messages.
     ///
     /// Retryable failures are retried at the whole-batch level after reconnecting worker
     /// connections when needed. This can replay rows that may already have been committed, so
-    /// callers should use idempotent writes, downstream deduplication, or offset-based streams
-    /// when duplicate-sensitive behavior matters. If more granular replay control is ever needed,
-    /// this can be evolved into request-level retries instead of replaying the whole batch.
+    /// callers should use an idempotent destination or downstream deduplication
+    /// when duplicate-sensitive behavior matters.
     pub async fn append_table_batches<M, I>(&self, append_requests: I) -> Result<Vec<BatchAppendResult>, BQError>
     where
         M: Message + Send + Sync + 'static,
@@ -1664,7 +1624,8 @@ impl StorageApi {
     ///
     /// Sends an invalidate message to each worker, which drops its current
     /// connection and recreates it before processing subsequent requests.
-    /// Call this after DDL changes to ensure writes use fresh connections.
+    /// This can be used after DDL changes when subsequent writes should use
+    /// newly established connections.
     pub async fn invalidate_all_connections(&self) {
         self.connection_workers.invalidate_all().await;
     }
@@ -1692,7 +1653,7 @@ impl StorageApi {
         Ok(request)
     }
 
-    /// Adds the write stream routing metadata required by [`Self::append_rows`].
+    /// Adds the write stream routing metadata required by `AppendRows` RPCs.
     fn add_append_rows_routing_metadata<T>(request: &mut Request<T>, stream_name: &str) -> Result<(), BQError> {
         let routing_value = format!("write_stream={stream_name}").try_into()?;
         request
@@ -1903,10 +1864,8 @@ pub mod test {
         mut rows: &[Actor],
         max_size: usize,
     ) -> Result<u8, Box<dyn std::error::Error>> {
-        // This loop is needed because the AppendRows API has a request size limit of 20 MB and the create_rows
-        // function may not process all the rows in the rows slice due to the caller's limit. Even though in this
-        // example we are only sending two rows (which won't breach the 20 MB limit), in a real-world scenario,
-        // we may have to send more rows and the loop will be needed to process all the rows.
+        // `create_rows` may encode only a prefix of the input, so continue until
+        // every row has been sent.
         let mut num_append_rows_calls = 0;
         loop {
             let (encoded_rows, num_processed) = StorageApi::create_rows(table_descriptor, rows, max_size);
@@ -1921,12 +1880,12 @@ pub mod test {
                 response?;
             }
 
-            // All the rows have been processed
+            // Stop after processing every row.
             if num_processed == rows.len() {
                 break;
             }
 
-            // Process the remaining rows
+            // Continue with the unprocessed suffix.
             rows = &rows[num_processed..];
         }
 
@@ -1951,14 +1910,14 @@ pub mod test {
         let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
         let rows: &[Actor] = &[actor1, actor2];
 
-        let max_size = 9 * 1024 * 1024; // 9 MB
+        let max_size = 9 * 1024 * 1024; // 9 MiB
         let num_append_rows_calls = call_append_rows(&mut client, &table_descriptor, &stream_name, rows, max_size)
             .await
             .unwrap();
         assert_eq!(num_append_rows_calls, 1);
 
-        // It was found after experimenting that one row in this test encodes to about 38 bytes
-        // We artificially limit the size of the rows to test that the loop processes all the rows
+        // Each test row encodes to roughly 38 bytes. Use a small limit to
+        // exercise the multi-request path.
         let max_size = 50; // 50 bytes
         let num_append_rows_calls = call_append_rows(&mut client, &table_descriptor, &stream_name, rows, max_size)
             .await
@@ -1979,7 +1938,7 @@ pub mod test {
 
         let table_descriptor = create_test_table_descriptor();
         let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
-        // Create multiple table batches (all targeting the same table in this test)
+        // Create multiple batches targeting the same table.
         let batch1 = TableBatch::new(
             stream_name.clone(),
             table_descriptor.clone(),
@@ -2001,7 +1960,7 @@ pub mod test {
 
         let table_batches = vec![batch1, batch2, batch3];
 
-        // Test that all batches are processed using the default max_concurrent_requests from config.
+        // Process all batches using the default in-flight limit.
         let batch_responses = client
             .storage_mut()
             .append_table_batches(
@@ -2012,18 +1971,18 @@ pub mod test {
             .await
             .unwrap();
 
-        // We expect 3 responses per batch (one for each batch)
+        // Expect one batch result for each input batch.
         assert_eq!(batch_responses.len(), 3);
 
         // Verify all responses are successful and track total bytes sent.
         let mut total_bytes_across_all_batches = 0;
         for batch_result in batch_responses {
-            // Verify each individual response for detailed error reporting.
+            // Check each individual response for detailed error reporting.
             for response in &batch_result.responses {
                 assert!(response.is_ok(), "Response should be successful: {response:?}");
             }
 
-            // Verify that some bytes were sent (should be greater than 0).
+            // A successful batch must report encoded request bytes.
             let bytes_sent = batch_result.total_bytes_sent;
             assert!(
                 bytes_sent > 0,
@@ -2041,7 +2000,7 @@ pub mod test {
             total_bytes_across_all_batches += bytes_sent;
         }
 
-        // Verify that we sent bytes across all batches
+        // Verify aggregate byte accounting across all batches.
         assert!(
             total_bytes_across_all_batches > 0,
             "Total bytes sent across all batches should be greater than 0"
