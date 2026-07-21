@@ -30,7 +30,7 @@ use tokio::time::sleep;
 use tonic::{
     codec::CompressionEncoding,
     transport::{Channel, ClientTlsConfig},
-    Code, Request, Status, Streaming,
+    Code, Request, Status,
 };
 use tracing::{debug, warn};
 
@@ -1456,54 +1456,6 @@ impl StorageApi {
         self
     }
 
-    /// Encodes message rows into protobuf format with size management.
-    ///
-    /// Processes as many rows as possible while respecting the specified
-    /// size limit. Returns the encoded protobuf data and the count of
-    /// rows successfully processed. When the returned count is less than
-    /// the input slice length, additional calls are required for remaining rows.
-    ///
-    /// `max_size_bytes` is an approximate limit based on the encoded row data.
-    pub fn create_rows<M: Message>(
-        table_descriptor: &TableDescriptor,
-        rows: &[M],
-        max_size_bytes: usize,
-    ) -> (append_rows_request::Rows, usize) {
-        let proto_schema = Self::create_proto_schema(table_descriptor);
-
-        let mut serialized_rows = Vec::new();
-        let mut total_size = 0;
-
-        for row in rows {
-            // Use encoded_len to avoid encoding a row that won't fit.
-            let row_size = row.encoded_len();
-            if total_size + row_size > max_size_bytes {
-                break;
-            }
-
-            let encoded_row = row.encode_to_vec();
-            debug_assert_eq!(
-                encoded_row.len(),
-                row_size,
-                "prost::encoded_len disagrees with encode_to_vec length"
-            );
-
-            serialized_rows.push(encoded_row);
-            total_size += row_size;
-        }
-
-        let num_rows_processed = serialized_rows.len();
-
-        let proto_rows = ProtoRows { serialized_rows };
-
-        let proto_data = ProtoData {
-            writer_schema: Some(proto_schema),
-            rows: Some(proto_rows),
-        };
-
-        (append_rows_request::Rows::ProtoRows(proto_data), num_rows_processed)
-    }
-
     /// Retrieves metadata for a BigQuery write stream.
     ///
     /// Fetches stream information including schema definition and state
@@ -1530,42 +1482,6 @@ impl StorageApi {
             .map(|resp| resp.into_inner())
             .map_err(|err| {
                 warn!(stream_name = %stream_name_str, error = %err, "failed to fetch write stream metadata");
-                err.into()
-            })
-    }
-
-    /// Appends rows to a BigQuery table using the Storage Write API.
-    ///
-    /// Transmits the provided rows to the specified stream and returns
-    /// a streaming response for processing results.
-    pub async fn append_rows(
-        &mut self,
-        stream_name: &StreamName,
-        rows: append_rows_request::Rows,
-        trace_id: String,
-    ) -> Result<Streaming<AppendRowsResponse>, BQError> {
-        let stream_name_str = stream_name.to_string();
-
-        let append_rows_request = AppendRowsRequest {
-            write_stream: stream_name_str.clone(),
-            offset: None,
-            trace_id,
-            missing_value_interpretations: HashMap::new(),
-            default_missing_value_interpretation: MissingValueInterpretation::Unspecified.into(),
-            rows: Some(rows),
-        };
-
-        let mut request =
-            Self::new_authorized_request(self.auth.clone(), tokio_stream::iter(vec![append_rows_request])).await?;
-        Self::add_append_rows_routing_metadata(&mut request, &stream_name_str)?;
-        let mut grpc_client = create_grpc_client(self.compression).await?;
-
-        grpc_client
-            .append_rows(request)
-            .await
-            .map(|resp| resp.into_inner())
-            .map_err(|err| {
-                warn!(stream_name = %stream_name_str, error = %err, "failed to append rows");
                 err.into()
             })
     }
@@ -1732,7 +1648,6 @@ impl StorageApi {
 pub mod test {
     use prost::Message;
     use std::time::{Duration, SystemTime};
-    use tokio_stream::StreamExt;
     use tonic::{Request, Status};
 
     use crate::google::cloud::bigquery::storage::v1::{append_rows_response, AppendRowsResponse, RowError};
@@ -1855,74 +1770,6 @@ pub mod test {
             last_name: "Doe".to_string(),
             last_update: "2007-02-15 09:34:33 UTC".to_string(),
         }
-    }
-
-    async fn call_append_rows(
-        client: &mut Client,
-        table_descriptor: &TableDescriptor,
-        stream_name: &StreamName,
-        mut rows: &[Actor],
-        max_size: usize,
-    ) -> Result<u8, Box<dyn std::error::Error>> {
-        // `create_rows` may encode only a prefix of the input, so continue until
-        // every row has been sent.
-        let mut num_append_rows_calls = 0;
-        loop {
-            let (encoded_rows, num_processed) = StorageApi::create_rows(table_descriptor, rows, max_size);
-            let mut streaming = client
-                .storage_mut()
-                .append_rows(stream_name, encoded_rows, "test-trace-id".to_string())
-                .await?;
-
-            num_append_rows_calls += 1;
-
-            while let Some(response) = streaming.next().await {
-                response?;
-            }
-
-            // Stop after processing every row.
-            if num_processed == rows.len() {
-                break;
-            }
-
-            // Continue with the unprocessed suffix.
-            rows = &rows[num_processed..];
-        }
-
-        Ok(num_append_rows_calls)
-    }
-
-    #[tokio::test]
-    async fn test_append_rows() {
-        let (ref project_id, ref dataset_id, ref table_id, ref sa_key) = env_vars();
-        let dataset_id = &format!("{dataset_id}_storage");
-
-        let mut client = Client::from_service_account_key_file(sa_key).await.unwrap();
-
-        setup_test_table(&mut client, project_id, dataset_id, table_id)
-            .await
-            .unwrap();
-
-        let table_descriptor = create_test_table_descriptor();
-        let actor1 = create_test_actor(1, "John");
-        let actor2 = create_test_actor(2, "Jane");
-
-        let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
-        let rows: &[Actor] = &[actor1, actor2];
-
-        let max_size = 9 * 1024 * 1024; // 9 MiB
-        let num_append_rows_calls = call_append_rows(&mut client, &table_descriptor, &stream_name, rows, max_size)
-            .await
-            .unwrap();
-        assert_eq!(num_append_rows_calls, 1);
-
-        // Each test row encodes to roughly 38 bytes. Use a small limit to
-        // exercise the multi-request path.
-        let max_size = 50; // 50 bytes
-        let num_append_rows_calls = call_append_rows(&mut client, &table_descriptor, &stream_name, rows, max_size)
-            .await
-            .unwrap();
-        assert_eq!(num_append_rows_calls, 2);
     }
 
     #[tokio::test]

@@ -1,15 +1,14 @@
 use gcp_bigquery_client::{
     env_vars,
-    storage::{ColumnMode, ColumnType, FieldDescriptor, StorageApi, StreamName, TableDescriptor},
+    storage::{BatchAppendRequest, ColumnMode, ColumnType, FieldDescriptor, StreamName, TableBatch, TableDescriptor},
 };
 use prost::Message;
-use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (ref project_id, ref dataset_id, ref table_id, ref gcp_sa_key) = env_vars();
 
-    let mut client = gcp_bigquery_client::Client::from_service_account_key_file(gcp_sa_key).await?;
+    let client = gcp_bigquery_client::Client::from_service_account_key_file(gcp_sa_key).await?;
 
     let field_descriptors = vec![
         FieldDescriptor {
@@ -70,14 +69,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
     let trace_id = "test_client".to_string();
+    let table_batch = TableBatch::new(stream_name, table_descriptor, vec![actor1, actor2]);
+    let append_request = BatchAppendRequest::new(table_batch, trace_id);
 
-    const MAX_SIZE: usize = 9 * 1024 * 1024; // 9 MB
-    let (rows, _) = StorageApi::create_rows(&table_descriptor, &[actor1, actor2], MAX_SIZE);
-    let mut streaming = client.storage_mut().append_rows(&stream_name, rows, trace_id).await?;
-
-    while let Some(resp) = streaming.next().await {
-        let resp = resp?;
-        println!("response: {resp:#?}");
+    for batch_result in client.storage().append_table_batches([append_request]).await? {
+        for response in batch_result.responses {
+            println!("response: {:#?}", response?);
+        }
     }
 
     Ok(())
