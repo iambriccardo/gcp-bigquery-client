@@ -53,18 +53,19 @@ static BIG_QUERY_STORAGE_API_URL: &str = "https://bigquerystorage.googleapis.com
 static BIGQUERY_STORAGE_API_DOMAIN: &str = "bigquerystorage.googleapis.com";
 /// Routing metadata header used by Google APIs.
 const X_GOOG_REQUEST_PARAMS_HEADER: &str = "x-goog-request-params";
-/// Maximum size limit for batched append requests in bytes.
+/// Approximate row-data target for batched append requests.
 ///
-/// Set to 9MB to provide safety margin under the 10MB BigQuery API limit,
-/// accounting for request metadata overhead.
-pub const MAX_BATCH_SIZE_BYTES: usize = 9 * 1024 * 1024;
-/// Maximum message size for tonic gRPC client configuration, matching the
-/// BigQuery Storage Write API's hard 10MB `AppendRowsRequest` limit.
+/// Set to 19 MiB to leave headroom below BigQuery's 20 MB limit for the
+/// stream name, schema, trace ID, and protobuf field framing. This follows the
+/// Google Java client's inexpensive payload-size approach.
+pub const MAX_BATCH_SIZE_BYTES: usize = 19 * 1024 * 1024;
+/// Maximum encoded message size for the tonic gRPC client.
 ///
-/// Anything above this is rejected by BigQuery regardless of what the local
-/// client allows, so a larger value here would only make this check a less
-/// precise stand-in for the real limit, not provide any additional headroom.
-const MAX_MESSAGE_SIZE_BYTES: usize = 10 * 1024 * 1024;
+/// BigQuery requires each serialized `AppendRowsRequest` to be smaller than
+/// 20 MB. The lower batching target keeps requests produced by this client
+/// away from this hard limit. The vendored proto and generated Rust docs still
+/// contain Google's stale 10 MB proto comment; it does not enforce a limit.
+const MAX_MESSAGE_SIZE_BYTES: usize = 20 * 1024 * 1024;
 /// The name of the default stream in BigQuery.
 ///
 /// This stream is a special built-in stream that always exists for a table.
@@ -669,7 +670,7 @@ impl Display for StreamName {
 /// Streaming adapter that converts message batches into [`AppendRowsRequest`] objects.
 ///
 /// Automatically chunks large batches into multiple requests while respecting
-/// the 10MB BigQuery API size limit. If a single row exceeds the configured
+/// the 20 MB BigQuery API size limit. If a single row exceeds the configured
 /// limit, it is sent alone and may be rejected by the server. Implements [`Stream`] for seamless
 /// integration with async streaming workflows and gRPC client operations.
 #[pin_project]
@@ -1507,8 +1508,9 @@ impl StorageApi {
     /// rows successfully processed. When the returned count is less than
     /// the input slice length, additional calls are required for remaining rows.
     ///
-    /// The size limit should be below 10MB to accommodate request metadata
-    /// overhead; 9MB provides a safe margin.
+    /// This limit applies only to the serialized row messages, not to the
+    /// complete `AppendRowsRequest`. Callers should leave room below the 20 MB
+    /// API limit for the schema, stream name, trace ID, and protobuf framing.
     pub fn create_rows<M: Message>(
         table_descriptor: &TableDescriptor,
         rows: &[M],
@@ -1908,9 +1910,9 @@ pub mod test {
         mut rows: &[Actor],
         max_size: usize,
     ) -> Result<u8, Box<dyn std::error::Error>> {
-        // This loop is needed because the AppendRows API has a payload size limit of 10MB and the create_rows
-        // function may not process all the rows in the rows slice due to the 10MB limit. Even though in this
-        // example we are only sending two rows (which won't breach the 10MB limit), in a real-world scenario,
+        // This loop is needed because the AppendRows API has a request size limit of 20 MB and the create_rows
+        // function may not process all the rows in the rows slice due to the caller's limit. Even though in this
+        // example we are only sending two rows (which won't breach the 20 MB limit), in a real-world scenario,
         // we may have to send more rows and the loop will be needed to process all the rows.
         let mut num_append_rows_calls = 0;
         loop {
