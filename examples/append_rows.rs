@@ -1,6 +1,6 @@
 use gcp_bigquery_client::{
     env_vars,
-    storage::{BatchAppendRequest, ColumnMode, ColumnType, FieldDescriptor, StreamName, TableBatch, TableDescriptor},
+    storage::{AppendRequest, ColumnMode, ColumnType, FieldDescriptor, StreamName, TableDescriptor},
 };
 use prost::Message;
 
@@ -69,11 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
     let trace_id = "test_client".to_string();
-    let table_batch = TableBatch::new(stream_name, table_descriptor, vec![actor1, actor2]);
-    let append_request = BatchAppendRequest::new(table_batch, trace_id);
+    let append_request = AppendRequest::new(stream_name, table_descriptor, vec![actor1, actor2], trace_id);
 
-    for batch_result in client.storage().append_table_batches([append_request]).await? {
-        for response in batch_result.responses {
+    for append_result in client.storage().append([append_request]).await? {
+        for response in append_result.responses {
             println!("response: {:#?}", response?);
         }
     }

@@ -164,7 +164,7 @@ fn status_from_rpc_status(status: &crate::google::rpc::Status) -> Status {
 /// Treating this as an explicit error keeps caller behavior consistent with transport errors.
 fn normalize_append_response(
     response: AppendRowsResponse,
-    batch_index: usize,
+    request_index: usize,
     stream_name: &str,
 ) -> Result<AppendRowsResponse, Status> {
     match response.response.as_ref() {
@@ -172,7 +172,7 @@ fn normalize_append_response(
         Some(append_rows_response::Response::Error(status)) => Err(status_from_rpc_status(status)),
         None => {
             warn!(
-                batch_index,
+                request_index,
                 stream_name = %stream_name,
                 "append response missing append_result/error outcome"
             );
@@ -240,12 +240,12 @@ fn calculate_append_retry_backoff(attempt: u32) -> Duration {
 /// and must be treated as a request failure rather than a successful append.
 fn ensure_non_empty_batch_responses(
     batch_responses: &mut Vec<Result<AppendRowsResponse, Status>>,
-    batch_index: usize,
+    request_index: usize,
     stream_name: &str,
 ) {
     if batch_responses.is_empty() {
         warn!(
-            batch_index,
+            request_index,
             stream_name = %stream_name,
             "append response stream ended without responses"
         );
@@ -265,9 +265,9 @@ pub struct StorageApiConfig {
     /// one gRPC connection. The field name is kept for backward compatibility.
     /// Default: 4.
     pub connection_pool_size: usize,
-    /// Maximum number of in-flight batch append jobs.
+    /// Maximum number of in-flight managed append operations.
     ///
-    /// The limit is shared by all connection workers. Each batch holds one
+    /// The limit is shared by all connection workers. Each operation holds one
     /// permit until it completes, including retries. Default: 400
     /// (`connection_pool_size × 100`).
     pub max_inflight_requests: usize,
@@ -288,7 +288,7 @@ impl StorageApiConfig {
     }
 
     /// Creates a new configuration with the specified maximum number of
-    /// in-flight batch append jobs.
+    /// in-flight managed append operations.
     pub fn with_max_inflight_requests(mut self, max_inflight_requests: usize) -> Self {
         self.max_inflight_requests = max_inflight_requests;
         self
@@ -412,38 +412,37 @@ pub struct TableDescriptor {
     pub field_descriptors: Vec<FieldDescriptor>,
 }
 
-/// Internal storage for [`TableBatch`] data.
+/// Internal storage for [`AppendRequest`] data.
 #[derive(Debug)]
-struct TableBatchInner<M> {
+struct AppendRequestInner<M> {
     stream_name: StreamName,
     table_descriptor: TableDescriptor,
     rows: Vec<M>,
+    trace_id: String,
 }
 
-/// Collection of rows targeting a specific BigQuery table for batch processing.
+/// Rows and destination metadata for one managed append operation.
 ///
-/// Encapsulates rows with their destination stream and schema metadata,
-/// enabling concurrent append operations across multiple tables. Cloning is
-/// cheap because the data is stored behind an [`Arc`].
+/// [`StorageApi::append`] accepts one or more requests and processes them
+/// concurrently. Large row collections are split into multiple wire requests.
+/// Cloning is cheap because the request data is stored behind an [`Arc`].
 #[derive(Debug)]
-pub struct TableBatch<M>(Arc<TableBatchInner<M>>);
+pub struct AppendRequest<M>(Arc<AppendRequestInner<M>>);
 
-impl<M> Clone for TableBatch<M> {
+impl<M> Clone for AppendRequest<M> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-impl<M> TableBatch<M> {
-    /// Creates a new table batch targeting the specified stream.
-    ///
-    /// Combines rows with their destination metadata to form a complete
-    /// batch ready for processing by append operations.
-    pub fn new(stream_name: StreamName, table_descriptor: TableDescriptor, rows: Vec<M>) -> Self {
-        Self(Arc::new(TableBatchInner {
+impl<M> AppendRequest<M> {
+    /// Creates a managed append request.
+    pub fn new(stream_name: StreamName, table_descriptor: TableDescriptor, rows: Vec<M>, trace_id: String) -> Self {
+        Self(Arc::new(AppendRequestInner {
             stream_name,
             table_descriptor,
             rows,
+            trace_id,
         }))
     }
 
@@ -457,83 +456,55 @@ impl<M> TableBatch<M> {
         &self.0.table_descriptor
     }
 
-    /// Returns the rows in this batch.
+    /// Returns the rows to append.
     pub fn rows(&self) -> &[M] {
         &self.0.rows
     }
-}
 
-/// A table batch paired with the trace identifier to use for its append requests.
-#[derive(Debug)]
-pub struct BatchAppendRequest<M> {
-    /// The batch to append.
-    table_batch: TableBatch<M>,
-    /// The trace identifier propagated to BigQuery for this logical batch.
-    trace_id: String,
-}
-
-impl<M> BatchAppendRequest<M> {
-    /// Creates a new batch append request.
-    pub fn new(table_batch: TableBatch<M>, trace_id: String) -> Self {
-        Self { table_batch, trace_id }
+    /// Returns the trace identifier propagated to BigQuery.
+    pub fn trace_id(&self) -> &str {
+        &self.0.trace_id
     }
 }
 
-impl<M> Clone for BatchAppendRequest<M> {
-    fn clone(&self) -> Self {
-        Self {
-            table_batch: self.table_batch.clone(),
-            trace_id: self.trace_id.clone(),
-        }
-    }
-}
-
-/// Result of processing a single table batch in concurrent append operations.
+/// Result of processing one [`AppendRequest`].
 ///
-/// Contains the batch processing results along with metadata about the operation,
-/// including the original batch index for result ordering and byte counts for
-/// monitoring.
+/// Results are returned in completion order. [`Self::request_index`] identifies
+/// the request's original position in the input iterator.
 #[derive(Debug)]
-pub struct BatchAppendResult {
-    /// Original index of the batch in the input vector.
+pub struct AppendResult {
+    /// Original index of the corresponding request in the input iterator.
+    pub request_index: usize,
+    /// Responses produced while appending this request.
     ///
-    /// Allows callers to correlate results with their original batch ordering
-    /// even when results are returned in completion order rather than submission order.
-    pub batch_index: usize,
-    /// Collection of append operation responses for this batch.
-    ///
-    /// Each batch may generate multiple append requests due to size limits,
-    /// resulting in multiple responses. Use [`Self::is_success`] to determine
-    /// whether the complete batch succeeded.
+    /// One managed request may produce multiple `AppendRows` requests due to
+    /// size limits. Use [`Self::is_success`] to determine whether the complete
+    /// operation succeeded.
     pub responses: Vec<Result<AppendRowsResponse, Status>>,
     /// Bytes sent across all requests and retry attempts.
     pub total_bytes_sent: usize,
     /// Bytes sent by the final successful attempt.
     ///
-    /// This is zero when the batch did not complete successfully.
+    /// This is zero when the operation did not complete successfully.
     pub successful_bytes_sent: usize,
 }
 
-impl BatchAppendResult {
-    /// Creates a new batch append result.
-    ///
-    /// Combines all result metadata into a single cohesive structure
-    /// for easier handling by calling code.
-    pub fn new(
-        batch_index: usize,
+impl AppendResult {
+    fn new(
+        request_index: usize,
         responses: Vec<Result<AppendRowsResponse, Status>>,
         total_bytes_sent: usize,
         successful_bytes_sent: usize,
     ) -> Self {
         Self {
-            batch_index,
+            request_index,
             responses,
             total_bytes_sent,
             successful_bytes_sent,
         }
     }
 
-    /// Returns true if all responses in this batch are successful append results.
+    /// Returns true if every response represents a successful append.
     ///
     /// A successful response must satisfy all of:
     /// - transport succeeded (`Ok`),
@@ -562,14 +533,14 @@ fn responses_are_successful(responses: &[Result<AppendRowsResponse, Status>]) ->
 
 /// Tracks attempted and successful request bytes across append retries.
 #[derive(Default)]
-struct BatchAppendByteCounts {
+struct AppendByteCounts {
     /// Bytes sent across every attempt.
     total: usize,
     /// Bytes sent by the successful attempt, or zero if none succeeded.
     successful: usize,
 }
 
-impl BatchAppendByteCounts {
+impl AppendByteCounts {
     /// Records the bytes and outcome of one append attempt.
     fn record_attempt(&mut self, responses: &[Result<AppendRowsResponse, Status>], bytes_sent: usize) {
         self.total += bytes_sent;
@@ -649,7 +620,7 @@ impl Display for StreamName {
     }
 }
 
-/// Streaming adapter that converts message batches into [`AppendRowsRequest`] objects.
+/// Converts a managed [`AppendRequest`] into wire-level [`AppendRowsRequest`] messages.
 ///
 /// Automatically chunks large batches using the approximate 19 MiB encoded-row
 /// target. A single row larger than the target is sent by itself and may be
@@ -657,10 +628,10 @@ impl Display for StreamName {
 /// client.
 #[pin_project]
 #[derive(Debug)]
-pub struct AppendRequestsStream<M> {
-    /// Table batch containing rows and metadata for append requests.
+struct AppendRowsRequestStream<M> {
+    /// Rows and metadata for the managed append operation.
     #[pin]
-    table_batch: TableBatch<M>,
+    append_request: AppendRequest<M>,
     /// Protobuf schema definition for the target table.
     proto_schema: ProtoSchema,
     /// Current position in the batch being processed.
@@ -672,34 +643,26 @@ pub struct AppendRequestsStream<M> {
     include_schema_next: bool,
     /// Shared atomic counter for tracking total bytes sent across all requests in this stream.
     bytes_sent_counter: Arc<AtomicUsize>,
-    /// Trace identifier propagated to all append requests in this batch.
-    trace_id: String,
 }
 
-impl<M> AppendRequestsStream<M> {
-    /// Creates a new streaming adapter from a table batch.
+impl<M> AppendRowsRequestStream<M> {
+    /// Creates a wire request stream from a managed append request.
     ///
     /// Initializes the stream with all necessary metadata for generating
     /// properly formatted append requests. The schema is included only
     /// in the first request of the stream.
-    fn new(
-        table_batch: TableBatch<M>,
-        proto_schema: ProtoSchema,
-        bytes_sent_counter: Arc<AtomicUsize>,
-        trace_id: String,
-    ) -> Self {
+    fn new(append_request: AppendRequest<M>, proto_schema: ProtoSchema, bytes_sent_counter: Arc<AtomicUsize>) -> Self {
         Self {
-            table_batch,
+            append_request,
             proto_schema,
             current_index: 0,
             include_schema_next: true,
             bytes_sent_counter,
-            trace_id,
         }
     }
 }
 
-impl<M> Stream for AppendRequestsStream<M>
+impl<M> Stream for AppendRowsRequestStream<M>
 where
     M: Message,
 {
@@ -712,7 +675,7 @@ where
     /// messages have been consumed.
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
-        let rows = this.table_batch.rows();
+        let rows = this.append_request.rows();
 
         if *this.current_index >= rows.len() {
             return Poll::Ready(None);
@@ -759,9 +722,9 @@ where
         };
 
         let append_rows_request = AppendRowsRequest {
-            write_stream: this.table_batch.stream_name().to_string(),
+            write_stream: this.append_request.stream_name().to_string(),
             offset: None,
-            trace_id: this.trace_id.clone(),
+            trace_id: this.append_request.trace_id().to_owned(),
             missing_value_interpretations: HashMap::new(),
             default_missing_value_interpretation: MissingValueInterpretation::Unspecified.into(),
             rows: Some(append_rows_request::Rows::ProtoRows(proto_data)),
@@ -785,18 +748,18 @@ where
 /// Handle returned when a batch append has been accepted by a connection worker.
 struct ConnectionWorkerAppendHandle {
     worker_index: usize,
-    batch_index: usize,
+    request_index: usize,
     stream_name: String,
-    response_rx: oneshot::Receiver<BatchAppendResult>,
+    response_rx: oneshot::Receiver<AppendResult>,
 }
 
 impl ConnectionWorkerAppendHandle {
     /// Waits for the worker to finish the batch, including internal retries.
-    async fn wait(self) -> Result<BatchAppendResult, BQError> {
+    async fn wait(self) -> Result<AppendResult, BQError> {
         self.response_rx.await.map_err(|err| {
             BQError::TonicStatusError(Status::unavailable(format!(
                 "connection worker response error for worker {} batch {} stream {:?}: {err}",
-                self.worker_index, self.batch_index, self.stream_name
+                self.worker_index, self.request_index, self.stream_name
             )))
         })
     }
@@ -905,10 +868,9 @@ trait AppendRowsWorkerRequest: Send {
 
 #[derive(Debug)]
 struct AppendRowsJob<M> {
-    table_batch: TableBatch<M>,
-    batch_index: usize,
-    trace_id: String,
-    response_tx: oneshot::Sender<BatchAppendResult>,
+    append_request: AppendRequest<M>,
+    request_index: usize,
+    response_tx: oneshot::Sender<AppendResult>,
     _permit: OwnedSemaphorePermit,
     _inflight_guard: InflightGuard,
 }
@@ -920,8 +882,7 @@ where
 {
     async fn run(self: Box<Self>, state: Arc<ConnectionWorkerState>) {
         let worker_id = state.worker_id;
-        let result =
-            worker_handle_table_batch_with_retry(state, self.table_batch, self.batch_index, self.trace_id).await;
+        let result = worker_handle_append_with_retry(state, self.append_request, self.request_index).await;
 
         // Return the result to the caller waiting on this job.
         if self.response_tx.send(result).is_err() {
@@ -963,27 +924,26 @@ async fn ensure_worker_client(state: &ConnectionWorkerState) -> Result<BigQueryW
 }
 
 /// Executes a single append attempt for a table batch on a worker connection.
-async fn worker_handle_table_batch_once<M>(
+async fn worker_handle_append_once<M>(
     state: Arc<ConnectionWorkerState>,
-    table_batch: TableBatch<M>,
-    batch_index: usize,
+    append_request: AppendRequest<M>,
+    request_index: usize,
     stream_name: &str,
     proto_schema: ProtoSchema,
     bytes_sent_counter: Arc<AtomicUsize>,
-    trace_id: String,
 ) -> WorkerAppendResult
 where
     M: Message + 'static,
 {
     let mut batch_responses = Vec::new();
 
-    let request_stream = AppendRequestsStream::new(table_batch, proto_schema, bytes_sent_counter, trace_id);
+    let request_stream = AppendRowsRequestStream::new(append_request, proto_schema, bytes_sent_counter);
     let mut request = match StorageApi::new_authorized_request(state.auth.clone(), request_stream).await {
         Ok(request) => request,
         Err(err) => {
             warn!(
                 worker_id = state.worker_id,
-                batch_index,
+                request_index,
                 stream_name = %stream_name,
                 error = %err,
                 "auth error in connection worker"
@@ -998,7 +958,7 @@ where
     if let Err(err) = StorageApi::add_append_rows_routing_metadata(&mut request, stream_name) {
         warn!(
             worker_id = state.worker_id,
-            batch_index,
+            request_index,
             stream_name = %stream_name,
             error = %err,
             "failed to add append rows routing metadata"
@@ -1026,14 +986,14 @@ where
 
             while let Some(response) = streaming_response.next().await {
                 let normalized_response = match response {
-                    Ok(response) => normalize_append_response(response, batch_index, stream_name),
+                    Ok(response) => normalize_append_response(response, request_index, stream_name),
                     Err(status) => Err(status),
                 };
 
                 if let Err(status) = &normalized_response {
                     warn!(
                         worker_id = state.worker_id,
-                        batch_index,
+                        request_index,
                         stream_name = %stream_name,
                         error = %status,
                         "batch append error response"
@@ -1043,12 +1003,12 @@ where
                 batch_responses.push(normalized_response);
             }
 
-            ensure_non_empty_batch_responses(&mut batch_responses, batch_index, stream_name);
+            ensure_non_empty_batch_responses(&mut batch_responses, request_index, stream_name);
         }
         Err(status) => {
             warn!(
                 worker_id = state.worker_id,
-                batch_index,
+                request_index,
                 stream_name = %stream_name,
                 error = %status,
                 "failed to append batch in connection worker"
@@ -1062,18 +1022,17 @@ where
 }
 
 /// Executes a table batch on a worker connection with internal retry/backoff handling.
-async fn worker_handle_table_batch_with_retry<M>(
+async fn worker_handle_append_with_retry<M>(
     state: Arc<ConnectionWorkerState>,
-    table_batch: TableBatch<M>,
-    batch_index: usize,
-    trace_id: String,
-) -> BatchAppendResult
+    append_request: AppendRequest<M>,
+    request_index: usize,
+) -> AppendResult
 where
     M: Message + Send + Sync + 'static,
 {
-    let stream_name = table_batch.stream_name().to_string();
-    let proto_schema = StorageApi::create_proto_schema(table_batch.table_descriptor());
-    let mut byte_counts = BatchAppendByteCounts::default();
+    let stream_name = append_request.stream_name().to_string();
+    let proto_schema = StorageApi::create_proto_schema(append_request.table_descriptor());
+    let mut byte_counts = AppendByteCounts::default();
 
     let mut batch_responses = Vec::new();
 
@@ -1081,14 +1040,13 @@ where
         batch_responses.clear();
         let attempt_bytes_sent_counter = Arc::new(AtomicUsize::new(0));
 
-        batch_responses = worker_handle_table_batch_once(
+        batch_responses = worker_handle_append_once(
             state.clone(),
-            table_batch.clone(),
-            batch_index,
+            append_request.clone(),
+            request_index,
             &stream_name,
             proto_schema.clone(),
             attempt_bytes_sent_counter.clone(),
-            trace_id.clone(),
         )
         .await;
 
@@ -1103,7 +1061,7 @@ where
         if decision.should_reset_connection {
             warn!(
                 worker_id = state.worker_id,
-                batch_index,
+                request_index,
                 stream_name = %stream_name,
                 attempt = attempt + 1,
                 "resetting worker connection after append stream termination"
@@ -1120,7 +1078,7 @@ where
 
             warn!(
                 worker_id = state.worker_id,
-                batch_index,
+                request_index,
                 stream_name = %stream_name,
                 attempt = attempt + 1,
                 max_attempts = MAX_APPEND_RETRY_ATTEMPTS,
@@ -1138,14 +1096,19 @@ where
 
     debug!(
         worker_id = state.worker_id,
-        batch_index,
+        request_index,
         stream_name = %stream_name,
         total_bytes_sent = byte_counts.total,
         successful_bytes_sent = byte_counts.successful,
         "batch completed in connection worker"
     );
 
-    BatchAppendResult::new(batch_index, batch_responses, byte_counts.total, byte_counts.successful)
+    AppendResult::new(
+        request_index,
+        batch_responses,
+        byte_counts.total,
+        byte_counts.successful,
+    )
 }
 
 /// Background task loop for a single connection worker.
@@ -1307,11 +1270,10 @@ impl ConnectionWorkerSet {
     }
 
     /// Dispatches a table batch using the power-of-two-choices strategy.
-    async fn append_table_batch<M>(
+    async fn append<M>(
         &self,
-        table_batch: TableBatch<M>,
-        batch_index: usize,
-        trace_id: String,
+        append_request: AppendRequest<M>,
+        request_index: usize,
     ) -> Result<ConnectionWorkerAppendHandle, BQError>
     where
         M: Message + Send + Sync + 'static,
@@ -1335,13 +1297,12 @@ impl ConnectionWorkerSet {
         let inflight_guard = self.inner.inflight_guard(worker_index);
 
         let sender = self.inner.senders[worker_index].clone();
-        let stream_name = table_batch.stream_name().to_string();
+        let stream_name = append_request.stream_name().to_string();
 
         let (response_tx, response_rx) = oneshot::channel();
         let message = ConnectionWorkerMessage::AppendRows(Box::new(AppendRowsJob {
-            table_batch,
-            batch_index,
-            trace_id,
+            append_request,
+            request_index,
             response_tx,
             _permit: permit,
             _inflight_guard: inflight_guard,
@@ -1350,7 +1311,7 @@ impl ConnectionWorkerSet {
         if let Err(err) = sender.send(message).await {
             warn!(
                 worker_index,
-                batch_index,
+                request_index,
                 stream_name = %stream_name,
                 error = %err,
                 "failed to send append request to connection worker"
@@ -1363,7 +1324,7 @@ impl ConnectionWorkerSet {
 
         Ok(ConnectionWorkerAppendHandle {
             worker_index,
-            batch_index,
+            request_index,
             stream_name,
             response_rx,
         })
@@ -1486,40 +1447,36 @@ impl StorageApi {
             })
     }
 
-    /// Appends rows from multiple table batches with concurrent processing.
+    /// Appends one or more managed requests concurrently.
     ///
-    /// Returns a collection of batch results containing
-    /// responses, metadata, and bytes sent for each batch processed. Results are
-    /// ordered by completion, not by submission; use `BatchAppendResult::batch_index`
-    /// to correlate with the original input order.
+    /// Each [`AppendRequest`] contains the destination stream, schema, rows, and
+    /// trace identifier for one logical operation. Results are ordered by
+    /// completion, not submission; use [`AppendResult::request_index`] to
+    /// correlate them with the input iterator.
     ///
-    /// Each attempt for a table batch starts one `AppendRows` RPC. A batch whose
-    /// estimated encoded row data exceeds 19 MiB is split into multiple request
-    /// messages.
+    /// Each attempt starts one `AppendRows` RPC. An input whose estimated encoded
+    /// row data exceeds 19 MiB is split into multiple wire request messages.
     ///
-    /// Retryable failures are retried at the whole-batch level after reconnecting worker
-    /// connections when needed. This can replay rows that may already have been committed, so
-    /// callers should use an idempotent destination or downstream deduplication
-    /// when duplicate-sensitive behavior matters.
-    pub async fn append_table_batches<M, I>(&self, append_requests: I) -> Result<Vec<BatchAppendResult>, BQError>
+    /// Retryable failures replay the entire managed request after reconnecting
+    /// worker connections when needed. This can replay rows that may already
+    /// have been committed, so callers should use an idempotent destination or
+    /// downstream deduplication when duplicate-sensitive behavior matters.
+    pub async fn append<M, I>(&self, append_requests: I) -> Result<Vec<AppendResult>, BQError>
     where
         M: Message + Send + Sync + 'static,
-        I: IntoIterator<Item = BatchAppendRequest<M>>,
+        I: IntoIterator<Item = AppendRequest<M>>,
         I::IntoIter: ExactSizeIterator,
     {
         let append_requests = append_requests.into_iter();
-        let batches_num = append_requests.len();
+        let requests_num = append_requests.len();
 
-        if batches_num == 0 {
+        if requests_num == 0 {
             return Ok(Vec::new());
         }
 
-        let mut handles = Vec::with_capacity(batches_num);
+        let mut handles = Vec::with_capacity(requests_num);
         for (idx, append_request) in append_requests.enumerate() {
-            let handle = self
-                .connection_workers
-                .append_table_batch(append_request.table_batch, idx, append_request.trace_id)
-                .await?;
+            let handle = self.connection_workers.append(append_request, idx).await?;
             handles.push(handle);
         }
 
@@ -1528,12 +1485,12 @@ impl StorageApi {
             pending_results.push(handle.wait());
         }
 
-        let mut batch_results = Vec::with_capacity(batches_num);
-        while let Some(batch_result) = pending_results.next().await {
-            batch_results.push(batch_result?);
+        let mut append_results = Vec::with_capacity(requests_num);
+        while let Some(append_result) = pending_results.next().await {
+            append_results.push(append_result?);
         }
 
-        Ok(batch_results)
+        Ok(append_results)
     }
 
     /// Invalidates all worker connections.
@@ -1646,11 +1603,18 @@ impl StorageApi {
 
 #[cfg(test)]
 pub mod test {
+    use futures::StreamExt;
     use prost::Message;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::time::{Duration, SystemTime};
     use tonic::{Request, Status};
 
-    use crate::google::cloud::bigquery::storage::v1::{append_rows_response, AppendRowsResponse, RowError};
+    use crate::google::cloud::bigquery::storage::v1::{
+        append_rows_request, append_rows_response, AppendRowsResponse, RowError,
+    };
     use crate::google::rpc::Status as GoogleRpcStatus;
     use crate::model::dataset::Dataset;
     use crate::model::field_type::FieldType;
@@ -1659,9 +1623,9 @@ pub mod test {
     use crate::model::table_schema::TableSchema;
     use crate::storage::{
         classify_batch_responses, ensure_non_empty_batch_responses, is_retryable_append_status,
-        normalize_append_response, should_reset_worker_connection_for_terminal_status, BatchAppendByteCounts,
-        BatchAppendRequest, BatchAppendResult, BatchResponseDecision, ColumnMode, ColumnType, FieldDescriptor,
-        StorageApi, StreamName, TableBatch, TableDescriptor,
+        normalize_append_response, should_reset_worker_connection_for_terminal_status, AppendByteCounts, AppendRequest,
+        AppendResult, AppendRowsRequestStream, BatchResponseDecision, ColumnMode, ColumnType, FieldDescriptor,
+        StorageApi, StreamName, TableDescriptor, MAX_BATCH_SIZE_BYTES, MAX_MESSAGE_SIZE_BYTES,
     };
     use crate::{env_vars, Client};
 
@@ -1675,6 +1639,12 @@ pub mod test {
         last_name: String,
         #[prost(string, tag = "4")]
         last_update: String,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct LargeRow {
+        #[prost(bytes, tag = "1")]
+        payload: Vec<u8>,
     }
 
     fn create_test_table_descriptor() -> TableDescriptor {
@@ -1726,6 +1696,81 @@ pub mod test {
         );
     }
 
+    #[tokio::test]
+    async fn test_append_request_stream_respects_batch_and_message_limits() {
+        const ROW_PAYLOAD_SIZE: usize = 6 * 1024 * 1024;
+
+        let stream_name = StreamName::new_default(
+            "test-project".to_owned(),
+            "test_dataset".to_owned(),
+            "test_table".to_owned(),
+        );
+        let table_descriptor = TableDescriptor {
+            field_descriptors: vec![FieldDescriptor {
+                number: 1,
+                name: "payload".to_owned(),
+                typ: ColumnType::Bytes,
+                mode: ColumnMode::Required,
+            }],
+        };
+        let row_encoded_len = LargeRow {
+            payload: vec![0; ROW_PAYLOAD_SIZE],
+        }
+        .encoded_len();
+        let rows = (0..4)
+            .map(|_| LargeRow {
+                payload: vec![0; ROW_PAYLOAD_SIZE],
+            })
+            .collect();
+        let append_request =
+            AppendRequest::new(stream_name, table_descriptor.clone(), rows, "test-trace-id".to_owned());
+        let bytes_sent = Arc::new(AtomicUsize::new(0));
+        let mut request_stream = AppendRowsRequestStream::new(
+            append_request,
+            StorageApi::create_proto_schema(&table_descriptor),
+            bytes_sent.clone(),
+        );
+
+        let first_request = request_stream.next().await.expect("first request should exist");
+        let second_request = request_stream.next().await.expect("second request should exist");
+        assert!(request_stream.next().await.is_none());
+
+        let first_request_size = first_request.encoded_len();
+        let second_request_size = second_request.encoded_len();
+        assert!(first_request_size < MAX_MESSAGE_SIZE_BYTES);
+        assert!(second_request_size < MAX_MESSAGE_SIZE_BYTES);
+        assert_eq!(
+            bytes_sent.load(Ordering::Relaxed),
+            first_request_size + second_request_size
+        );
+
+        let append_rows_request::Rows::ProtoRows(first_proto_data) =
+            first_request.rows.expect("first request should contain rows");
+        let append_rows_request::Rows::ProtoRows(second_proto_data) =
+            second_request.rows.expect("second request should contain rows");
+
+        assert_eq!(
+            first_proto_data
+                .rows
+                .expect("first request should contain proto rows")
+                .serialized_rows
+                .len(),
+            3
+        );
+        assert_eq!(
+            second_proto_data
+                .rows
+                .expect("second request should contain proto rows")
+                .serialized_rows
+                .len(),
+            1
+        );
+        assert!(first_proto_data.writer_schema.is_some());
+        assert!(second_proto_data.writer_schema.is_none());
+        assert!(3 * row_encoded_len < MAX_BATCH_SIZE_BYTES);
+        assert!(4 * row_encoded_len > MAX_BATCH_SIZE_BYTES);
+    }
+
     async fn setup_test_table(
         client: &mut Client,
         project_id: &str,
@@ -1773,9 +1818,9 @@ pub mod test {
     }
 
     #[tokio::test]
-    async fn test_append_table_batches() {
+    async fn test_append() {
         let (ref project_id, ref dataset_id, ref table_id, ref sa_key) = env_vars();
-        let dataset_id = &format!("{dataset_id}_storage_table_batches");
+        let dataset_id = &format!("{dataset_id}_storage_append_requests");
 
         let mut client = Client::from_service_account_key_file(sa_key).await.unwrap();
 
@@ -1786,7 +1831,7 @@ pub mod test {
         let table_descriptor = create_test_table_descriptor();
         let stream_name = StreamName::new_default(project_id.clone(), dataset_id.clone(), table_id.clone());
         // Create multiple batches targeting the same table.
-        let batch1 = TableBatch::new(
+        let batch1 = AppendRequest::new(
             stream_name.clone(),
             table_descriptor.clone(),
             vec![
@@ -1795,28 +1840,27 @@ pub mod test {
                 create_test_actor(3, "Bob"),
                 create_test_actor(4, "Alice"),
             ],
+            "test-trace-id".to_string(),
         );
 
-        let batch2 = TableBatch::new(
+        let batch2 = AppendRequest::new(
             stream_name.clone(),
             table_descriptor.clone(),
             vec![create_test_actor(5, "Charlie"), create_test_actor(6, "Dave")],
+            "test-trace-id".to_string(),
         );
 
-        let batch3 = TableBatch::new(stream_name, table_descriptor, vec![create_test_actor(7, "Eve")]);
+        let batch3 = AppendRequest::new(
+            stream_name,
+            table_descriptor,
+            vec![create_test_actor(7, "Eve")],
+            "test-trace-id".to_string(),
+        );
 
-        let table_batches = vec![batch1, batch2, batch3];
+        let append_requests = vec![batch1, batch2, batch3];
 
         // Process all batches using the default in-flight limit.
-        let batch_responses = client
-            .storage_mut()
-            .append_table_batches(
-                table_batches
-                    .into_iter()
-                    .map(|table_batch| BatchAppendRequest::new(table_batch, "test-trace-id".to_string())),
-            )
-            .await
-            .unwrap();
+        let batch_responses = client.storage().append(append_requests).await.unwrap();
 
         // Expect one batch result for each input batch.
         assert_eq!(batch_responses.len(), 3);
@@ -1834,13 +1878,13 @@ pub mod test {
             assert!(
                 bytes_sent > 0,
                 "Bytes sent should be greater than 0 for batch {}, got: {}",
-                batch_result.batch_index,
+                batch_result.request_index,
                 bytes_sent
             );
             assert!(
                 batch_result.successful_bytes_sent > 0,
                 "Successful bytes sent should be greater than 0 for batch {}",
-                batch_result.batch_index
+                batch_result.request_index
             );
             assert!(batch_result.successful_bytes_sent <= bytes_sent);
 
@@ -2088,7 +2132,7 @@ pub mod test {
     }
 
     #[test]
-    fn test_batch_append_result_is_success_requires_append_result_and_no_row_errors() {
+    fn test_append_result_is_success_requires_append_result_and_no_row_errors() {
         let success_response = AppendRowsResponse {
             updated_schema: None,
             row_errors: Vec::new(),
@@ -2097,7 +2141,7 @@ pub mod test {
                 append_rows_response::AppendResult { offset: None },
             )),
         };
-        let batch_result = BatchAppendResult::new(0, vec![Ok(success_response)], 10, 10);
+        let batch_result = AppendResult::new(0, vec![Ok(success_response)], 10, 10);
         assert!(batch_result.is_success());
         assert_eq!(batch_result.total_bytes_sent, 10);
         assert_eq!(batch_result.successful_bytes_sent, 10);
@@ -2108,7 +2152,7 @@ pub mod test {
             write_stream: "projects/test/datasets/test/tables/test/streams/_default".to_string(),
             response: None,
         };
-        let batch_result = BatchAppendResult::new(0, vec![Ok(missing_response)], 10, 0);
+        let batch_result = AppendResult::new(0, vec![Ok(missing_response)], 10, 0);
         assert!(!batch_result.is_success());
         assert_eq!(batch_result.successful_bytes_sent, 0);
 
@@ -2120,13 +2164,13 @@ pub mod test {
                 append_rows_response::AppendResult { offset: None },
             )),
         };
-        let batch_result = BatchAppendResult::new(0, vec![Ok(row_error_response)], 10, 0);
+        let batch_result = AppendResult::new(0, vec![Ok(row_error_response)], 10, 0);
         assert!(!batch_result.is_success());
         assert_eq!(batch_result.successful_bytes_sent, 0);
     }
 
     #[test]
-    fn test_batch_append_byte_counts_excludes_failed_retry_attempts() {
+    fn test_append_byte_counts_excludes_failed_retry_attempts() {
         let successful_response = AppendRowsResponse {
             updated_schema: None,
             row_errors: Vec::new(),
@@ -2136,7 +2180,7 @@ pub mod test {
             )),
         };
         let failed_response = Err(Status::unavailable("retry"));
-        let mut byte_counts = BatchAppendByteCounts::default();
+        let mut byte_counts = AppendByteCounts::default();
 
         byte_counts.record_attempt(&[failed_response], 100);
         assert_eq!(byte_counts.total, 100);
