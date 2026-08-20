@@ -116,7 +116,7 @@ pub struct ProtoSchema {
     /// For additional information for how proto types and values map onto BigQuery
     /// see: <https://cloud.google.com/bigquery/docs/write-api#data_type_conversions>
     #[prost(message, optional, tag = "1")]
-    pub proto_descriptor: ::core::option::Option<::prost_types::DescriptorProto>,
+    pub proto_descriptor: ::core::option::Option<crate::storage::ProtoDescriptor>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ProtoRows {

@@ -8,15 +8,12 @@ use futures::stream::{FuturesUnordered, Stream};
 use futures::StreamExt;
 use pin_project::pin_project;
 use prost::Message;
-use prost_types::{
-    field_descriptor_proto::{Label, Type},
-    DescriptorProto, FieldDescriptorProto,
-};
+use prost_types::field_descriptor_proto::{Label, Type};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     fmt::Display,
     sync::{
@@ -410,6 +407,51 @@ pub struct FieldDescriptor {
 pub struct TableDescriptor {
     /// Collection of field descriptors defining the table schema.
     pub field_descriptors: Vec<FieldDescriptor>,
+}
+
+/// Protocol Buffer schema descriptor sent to the BigQuery Storage Write API.
+///
+/// This wire-compatible descriptor owns the subset of
+/// `google.protobuf.DescriptorProto` used by the writer. Its field options can
+/// carry BigQuery's `column_name` extension for flexible column names.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoDescriptor {
+    /// Name of the generated Protocol Buffer message.
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    /// Fields in the generated Protocol Buffer message.
+    #[prost(message, repeated, tag = "2")]
+    pub field: Vec<ProtoFieldDescriptor>,
+}
+
+/// Protocol Buffer field descriptor sent to the BigQuery Storage Write API.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoFieldDescriptor {
+    /// Protocol Buffer-safe field name.
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    /// Unique, nonzero Protocol Buffer field number.
+    #[prost(int32, optional, tag = "3")]
+    pub number: Option<i32>,
+    /// Protocol Buffer field cardinality.
+    #[prost(enumeration = "Label", optional, tag = "4")]
+    pub label: Option<i32>,
+    /// Protocol Buffer field type.
+    #[prost(enumeration = "Type", optional, tag = "5")]
+    pub r#type: Option<i32>,
+    /// BigQuery-specific field options.
+    #[prost(message, optional, tag = "8")]
+    pub options: Option<BigQueryFieldOptions>,
+}
+
+/// BigQuery extensions to `google.protobuf.FieldOptions`.
+///
+/// See <https://cloud.google.com/bigquery/docs/schemas#flexible-column-names>.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BigQueryFieldOptions {
+    /// Actual BigQuery column name when it cannot be used as a protobuf field.
+    #[prost(string, optional, tag = "454943157")]
+    pub column_name: Option<String>,
 }
 
 /// Internal storage for [`AppendRequest`] data.
@@ -1536,31 +1578,66 @@ impl StorageApi {
         Ok(())
     }
 
+    /// Returns whether a name can be used directly as a Protocol Buffer field.
+    fn is_protobuf_field_name(name: &str) -> bool {
+        let Some((&first, rest)) = name.as_bytes().split_first() else {
+            return false;
+        };
+
+        (first.is_ascii_alphabetic() || first == b'_')
+            && rest.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    }
+
+    /// Creates a protobuf-safe placeholder that does not collide with another field.
+    fn create_flexible_field_name(number: u32, used_names: &mut HashSet<String>) -> String {
+        let base_name = format!("_bq_flexible_column_{number}");
+        let mut name = base_name.clone();
+        let mut suffix = 1;
+
+        while !used_names.insert(name.clone()) {
+            name = format!("{base_name}_{suffix}");
+            suffix += 1;
+        }
+
+        name
+    }
+
     /// Converts table field descriptors to protobuf field descriptors.
     ///
     /// Transforms the high-level field descriptors into the protobuf
     /// format required by BigQuery Storage Write API schema definitions.
     /// Maps column types and modes to their protobuf equivalents.
-    fn create_field_descriptors(table_descriptor: &TableDescriptor) -> Vec<FieldDescriptorProto> {
+    fn create_field_descriptors(table_descriptor: &TableDescriptor) -> Vec<ProtoFieldDescriptor> {
+        let mut used_names: HashSet<String> = table_descriptor
+            .field_descriptors
+            .iter()
+            .filter(|field| Self::is_protobuf_field_name(&field.name))
+            .map(|field| field.name.clone())
+            .collect();
+
         table_descriptor
             .field_descriptors
             .iter()
             .map(|fd| {
                 let typ: Type = fd.typ.into();
                 let label: Label = fd.mode.into();
+                let (name, options) = if Self::is_protobuf_field_name(&fd.name) {
+                    (fd.name.clone(), None)
+                } else {
+                    let name = Self::create_flexible_field_name(fd.number, &mut used_names);
+                    let options = BigQueryFieldOptions {
+                        column_name: Some(fd.name.clone()),
+                    };
 
-                FieldDescriptorProto {
-                    name: Some(fd.name.clone()),
+                    (name, Some(options))
+                };
+
+                ProtoFieldDescriptor {
+                    name: Some(name),
                     number: Some(fd.number as i32),
                     label: Some(label.into()),
                     r#type: Some(typ.into()),
-                    type_name: None,
-                    extendee: None,
-                    default_value: None,
-                    oneof_index: None,
-                    json_name: None,
-                    options: None,
-                    proto3_optional: None,
+                    options,
                 }
             })
             .collect()
@@ -1568,21 +1645,13 @@ impl StorageApi {
 
     /// Creates a protobuf descriptor from field descriptors.
     ///
-    /// Wraps field descriptors in a [`DescriptorProto`] structure with
+    /// Wraps field descriptors in a [`ProtoDescriptor`] structure with
     /// the standard table schema name. Used as an intermediate step
     /// in protobuf schema generation.
-    fn create_proto_descriptor(field_descriptors: Vec<FieldDescriptorProto>) -> DescriptorProto {
-        DescriptorProto {
+    fn create_proto_descriptor(field_descriptors: Vec<ProtoFieldDescriptor>) -> ProtoDescriptor {
+        ProtoDescriptor {
             name: Some("table_schema".to_string()),
             field: field_descriptors,
-            extension: vec![],
-            nested_type: vec![],
-            enum_type: vec![],
-            extension_range: vec![],
-            oneof_decl: vec![],
-            options: None,
-            reserved_range: vec![],
-            reserved_name: vec![],
         }
     }
 
@@ -1676,6 +1745,82 @@ pub mod test {
         ];
 
         TableDescriptor { field_descriptors }
+    }
+
+    #[test]
+    fn proto_schema_uses_direct_names_for_protobuf_identifiers() {
+        let proto_schema = StorageApi::create_proto_schema(&create_test_table_descriptor());
+        let descriptor = proto_schema.proto_descriptor.unwrap();
+
+        assert_eq!(descriptor.field[0].name.as_deref(), Some("actor_id"));
+        assert!(descriptor.field[0].options.is_none());
+    }
+
+    #[test]
+    fn proto_schema_annotates_flexible_column_names() {
+        let table_descriptor = TableDescriptor {
+            field_descriptors: vec![FieldDescriptor {
+                number: 1,
+                name: "Display Label".to_string(),
+                typ: ColumnType::String,
+                mode: ColumnMode::Nullable,
+            }],
+        };
+
+        let proto_schema = StorageApi::create_proto_schema(&table_descriptor);
+        let field = &proto_schema.proto_descriptor.unwrap().field[0];
+
+        assert_eq!(field.name.as_deref(), Some("_bq_flexible_column_1"));
+        assert_eq!(
+            field
+                .options
+                .as_ref()
+                .and_then(|options| options.column_name.as_deref()),
+            Some("Display Label")
+        );
+
+        // The annotation must be encoded as BigQuery's FieldOptions extension
+        // 454943157, rather than as an uninterpreted descriptor option.
+        assert_eq!(
+            field.options.as_ref().unwrap().encode_to_vec(),
+            [
+                0xaa, 0x9b, 0xbc, 0xc7, 0x0d, 0x0d, b'D', b'i', b's', b'p', b'l', b'a', b'y', b' ', b'L', b'a', b'b',
+                b'e', b'l',
+            ]
+        );
+    }
+
+    #[test]
+    fn flexible_column_placeholders_do_not_collide_with_direct_names() {
+        let table_descriptor = TableDescriptor {
+            field_descriptors: vec![
+                FieldDescriptor {
+                    number: 1,
+                    name: "_bq_flexible_column_2".to_string(),
+                    typ: ColumnType::String,
+                    mode: ColumnMode::Nullable,
+                },
+                FieldDescriptor {
+                    number: 2,
+                    name: "order-id".to_string(),
+                    typ: ColumnType::String,
+                    mode: ColumnMode::Nullable,
+                },
+            ],
+        };
+
+        let proto_schema = StorageApi::create_proto_schema(&table_descriptor);
+        let fields = &proto_schema.proto_descriptor.unwrap().field;
+
+        assert_eq!(fields[0].name.as_deref(), Some("_bq_flexible_column_2"));
+        assert_eq!(fields[1].name.as_deref(), Some("_bq_flexible_column_2_1"));
+        assert_eq!(
+            fields[1]
+                .options
+                .as_ref()
+                .and_then(|options| options.column_name.as_deref()),
+            Some("order-id")
+        );
     }
 
     #[test]
