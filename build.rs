@@ -11,6 +11,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tonic_prost_build::configure()
     //     .build_server(false)
     //     .out_dir("src/google")
+    //     .extern_path(
+    //         ".google.protobuf.DescriptorProto",
+    //         "crate::storage::ProtoDescriptor",
+    //     )
     //     .compile_protos(
     //         &["googleapis/google/cloud/bigquery/storage/v1/storage.proto"],
     //         &["googleapis"],
